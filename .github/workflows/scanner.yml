@@ -1,0 +1,105 @@
+name: Binance Futures Scanner (Scanner-f)
+
+on:
+  # กดรันด้วยตัวเองได้จากหน้า Actions บน GitHub
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "โหมดการทำงาน (once = สแกน 1 รอบ, realtime = สแกนต่อเนื่อง WebSocket, test-alert = ทดสอบแจ้งเตือน)"
+        required: true
+        default: "once"
+        type: choice
+        options:
+          - once
+          - realtime
+          - test-alert
+      duration_mins:
+        description: "ระยะเวลารันต่อเนื่อง (นาที) สำหรับโหมด realtime (สูงสุด 350 นาทีต่อรอบ)"
+        required: false
+        default: "60"
+        type: string
+      kline_interval:
+        description: "Timeframe แท่งเทียน (เช่น 1m, 5m, 15m, 1h)"
+        required: false
+        default: "5m"
+        type: choice
+        options:
+          - 1m
+          - 3m
+          - 5m
+          - 15m
+          - 1h
+          - 4h
+
+  # รันอัตโนมัติทุกๆ 15 นาทีในโหมด --once
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: scanner-f-runtime
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Run Binance USDT-M Scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Restore Scanner State (Open Interest & Alert Cooldowns)
+        uses: actions/cache/restore@v4
+        with:
+          path: .scanner_state.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: |
+            scanner-state-
+
+      - name: Build Scanner-f (Release)
+        run: cargo build --release --locked
+
+      - name: Run Scanner-f
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BINANCE_FAPI_URL: ${{ vars.BINANCE_FAPI_URL || secrets.BINANCE_FAPI_URL || 'https://fapi.binance.com' }}
+          BINANCE_FSTREAM_URL: ${{ vars.BINANCE_FSTREAM_URL || secrets.BINANCE_FSTREAM_URL || 'wss://fstream.binance.com' }}
+          HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
+          MIN_QUOTE_VOLUME_24H: ${{ vars.MIN_QUOTE_VOLUME_24H || '20000000' }}
+          MAX_SYMBOLS: ${{ vars.MAX_SYMBOLS || '150' }}
+          KLINE_INTERVAL: ${{ inputs.kline_interval || vars.KLINE_INTERVAL || '5m' }}
+          PRICE_CHANGE_THRESHOLD_PCT: ${{ vars.PRICE_CHANGE_THRESHOLD_PCT || '2.5' }}
+          VOLUME_SPIKE_MULTIPLIER: ${{ vars.VOLUME_SPIKE_MULTIPLIER || '3.5' }}
+          RSI_OVERBOUGHT: ${{ vars.RSI_OVERBOUGHT || '75.0' }}
+          RSI_OVERSOLD: ${{ vars.RSI_OVERSOLD || '25.0' }}
+          FUNDING_RATE_THRESHOLD_PCT: ${{ vars.FUNDING_RATE_THRESHOLD_PCT || '0.10' }}
+          OI_SPIKE_THRESHOLD_PCT: ${{ vars.OI_SPIKE_THRESHOLD_PCT || '3.0' }}
+          MIN_LIQUIDATION_USD: ${{ vars.MIN_LIQUIDATION_USD || '50000' }}
+          ALERT_COOLDOWN_SECS: ${{ vars.ALERT_COOLDOWN_SECS || '900' }}
+          RUN_DURATION_MINS: ${{ inputs.duration_mins || '60' }}
+        run: |
+          MODE="${{ inputs.mode || 'once' }}"
+          echo "Running Scanner-f in mode: ${MODE}"
+          if [ "${MODE}" = "test-alert" ]; then
+            ./target/release/scanner-f --test-alert
+          elif [ "${MODE}" = "realtime" ]; then
+            ./target/release/scanner-f
+          else
+            ./target/release/scanner-f --once
+          fi
+
+      - name: Save Scanner State (Open Interest & Alert Cooldowns)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .scanner_state.json
+          key: scanner-state-${{ github.run_id }}

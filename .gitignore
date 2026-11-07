@@ -1,0 +1,5 @@
+/target
+.env
+*.log
+.DS_Store
+.scanner_state.json
