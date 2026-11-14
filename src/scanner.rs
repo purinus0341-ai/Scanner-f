@@ -14,8 +14,9 @@ use crate::binance::{
 };
 use crate::config::ScannerConfig;
 use crate::indicators::{
-    append_trade_plan, calculate_bollinger_bands, calculate_rsi, calculate_volume_ratio,
-    detect_ema_crossover, CrossoverType,
+    analyze_timeframe_state, append_mtf_trade_plan, append_trade_plan, calculate_bollinger_bands,
+    calculate_rsi, calculate_volume_ratio, detect_ema_crossover, evaluate_mtf_confluence,
+    CrossoverType,
 };
 use crate::models::{
     Candle, ScanSignal, SignalCategory, SignalDirection, Ticker24hr, WsForceOrderEvent,
@@ -605,6 +606,78 @@ impl FuturesScanner {
                     ],
                     timestamp: Utc::now(),
                 });
+            }
+        }
+
+        if signals.is_empty() {
+            return signals;
+        }
+
+        // Fetch 15m and 1h candles concurrently for Multi-Timeframe Confluence (5m + 15m + 1h)
+        let (res_15m, res_1h) = tokio::join!(
+            self.client.fetch_klines(symbol, "15m", 65),
+            self.client.fetch_klines(symbol, "1h", 65)
+        );
+
+        if let (Ok(candles_15m), Ok(candles_1h)) = (res_15m, res_1h) {
+            let state_5m_opt = analyze_timeframe_state(
+                candles,
+                self.config.rsi_period,
+                self.config.rsi_overbought,
+                self.config.rsi_oversold,
+                self.config.volume_lookback,
+            );
+            let state_15m_opt = analyze_timeframe_state(
+                &candles_15m,
+                self.config.rsi_period,
+                self.config.rsi_overbought,
+                self.config.rsi_oversold,
+                self.config.volume_lookback,
+            );
+            let state_1h_opt = analyze_timeframe_state(
+                &candles_1h,
+                self.config.rsi_period,
+                self.config.rsi_overbought,
+                self.config.rsi_oversold,
+                self.config.volume_lookback,
+            );
+
+            if let (Some(state_5m), Some(state_15m), Some(state_1h)) =
+                (state_5m_opt, state_15m_opt, state_1h_opt)
+            {
+                let mut mtf_filtered = Vec::new();
+                for mut sig in signals {
+                    let is_reversal = matches!(
+                        sig.category,
+                        SignalCategory::RsiOverbought | SignalCategory::RsiOversold
+                    );
+                    let (stars, grade_str, aligned_1h, reasons) = evaluate_mtf_confluence(
+                        sig.direction,
+                        is_reversal,
+                        &state_5m,
+                        &state_15m,
+                        &state_1h,
+                        self.config.rsi_overbought,
+                        self.config.rsi_oversold,
+                    );
+                    if stars >= 2 {
+                        sig.timeframe = format!("{}+15m+1h", self.config.kline_interval);
+                        append_mtf_trade_plan(
+                            &mut sig.details,
+                            sig.direction,
+                            sig.price,
+                            &state_5m,
+                            &state_15m,
+                            &state_1h,
+                            &candles_15m,
+                            &grade_str,
+                            aligned_1h,
+                            &reasons,
+                        );
+                        mtf_filtered.push(sig);
+                    }
+                }
+                return mtf_filtered;
             }
         }
 

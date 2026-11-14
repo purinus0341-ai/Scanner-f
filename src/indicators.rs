@@ -225,6 +225,395 @@ pub fn calculate_atr(candles: &[Candle], period: usize) -> Option<f64> {
     Some(window.iter().sum::<f64>() / (window.len() as f64))
 }
 
+#[derive(Debug, Clone)]
+pub struct TimeframeState {
+    pub trend: crate::models::SignalDirection,
+    pub rsi: f64,
+    pub ema9: f64,
+    pub ema21: f64,
+    pub ema50: f64,
+    pub vol_ratio: f64,
+    pub atr: f64,
+    pub label: String,
+}
+
+/// Evaluates EMA(9/21/50), RSI(14), Volume Ratio, and ATR(14) for a single timeframe.
+pub fn analyze_timeframe_state(
+    candles: &[Candle],
+    rsi_period: usize,
+    rsi_ob: f64,
+    rsi_os: f64,
+    vol_lookback: usize,
+) -> Option<TimeframeState> {
+    use crate::models::SignalDirection;
+
+    if candles.len() < 25 {
+        return None;
+    }
+
+    let latest = candles.last()?;
+    let closed_slice = if !latest.is_closed && candles.len() > 1 {
+        &candles[..candles.len() - 1]
+    } else {
+        candles
+    };
+
+    let closes: Vec<f64> = closed_slice.iter().map(|c| c.close).collect();
+    let price = latest.close;
+
+    let rsi = calculate_rsi(&closes, rsi_period).unwrap_or(50.0);
+    let ema9 = calculate_ema_series(&closes, 9)
+        .last()
+        .copied()
+        .unwrap_or(price);
+    let ema21 = calculate_ema_series(&closes, 21)
+        .last()
+        .copied()
+        .unwrap_or(price);
+    let ema50 = calculate_ema_series(&closes, 50)
+        .last()
+        .copied()
+        .unwrap_or(ema21);
+
+    let vol_ratio = calculate_volume_ratio(candles, vol_lookback)
+        .map(|(r, _)| r)
+        .unwrap_or(1.0);
+    let atr = calculate_atr(closed_slice, 14).unwrap_or(price * 0.01);
+
+    let (trend, mut label) = if ema9 > ema21 && price >= ema21 {
+        (
+            SignalDirection::Bullish,
+            format!("🟢 ขาขึ้น (EMA9>21, RSI {:.1})", rsi),
+        )
+    } else if ema9 < ema21 && price <= ema21 {
+        (
+            SignalDirection::Bearish,
+            format!("🔴 ขาลง (EMA9<21, RSI {:.1})", rsi),
+        )
+    } else if rsi >= 55.0 && price >= ema50 {
+        (
+            SignalDirection::Bullish,
+            format!("🟢 พักตัวขาขึ้น (RSI {:.1})", rsi),
+        )
+    } else if rsi <= 45.0 && price <= ema50 {
+        (
+            SignalDirection::Bearish,
+            format!("🔴 พักตัวขาลง (RSI {:.1})", rsi),
+        )
+    } else {
+        (
+            SignalDirection::Neutral,
+            format!("⚪ ไซด์เวย์ (RSI {:.1})", rsi),
+        )
+    };
+
+    if rsi <= rsi_os {
+        label.push_str(" [Oversold 🧊]");
+    } else if rsi >= rsi_ob {
+        label.push_str(" [Overbought 🔥]");
+    }
+
+    Some(TimeframeState {
+        trend,
+        rsi,
+        ema9,
+        ema21,
+        ema50,
+        vol_ratio,
+        atr,
+        label,
+    })
+}
+
+/// Evaluates Multi-Timeframe Confluence across 5m, 15m, and 1h (returns stars 1..=3, grade label, aligned_1h, and reasons).
+pub fn evaluate_mtf_confluence(
+    direction: crate::models::SignalDirection,
+    is_reversal: bool,
+    state_5m: &TimeframeState,
+    state_15m: &TimeframeState,
+    state_1h: &TimeframeState,
+    rsi_ob: f64,
+    rsi_os: f64,
+) -> (u8, String, bool, Vec<String>) {
+    use crate::models::SignalDirection;
+
+    let mut score: u8 = 1;
+    let mut reasons = Vec::new();
+
+    match direction {
+        SignalDirection::Bullish => {
+            if state_15m.trend == SignalDirection::Bullish {
+                score += 1;
+                reasons.push("15m โมเมนตัมขาขึ้นหนุน".to_string());
+            } else if is_reversal && state_15m.rsi <= (rsi_os + 5.0) {
+                score += 1;
+                reasons.push(format!(
+                    "15m เข้าเขต Oversold ร่วมด้วย (RSI {:.1})",
+                    state_15m.rsi
+                ));
+            } else if state_5m.vol_ratio >= 2.2 && state_15m.rsi >= 48.0 {
+                score += 1;
+                reasons.push(format!("5m วอลุ่มเข้าหนาแน่น ({:.1}x)", state_5m.vol_ratio));
+            }
+        }
+        SignalDirection::Bearish => {
+            if state_15m.trend == SignalDirection::Bearish {
+                score += 1;
+                reasons.push("15m โมเมนตัมขาลงกดดัน".to_string());
+            } else if is_reversal && state_15m.rsi >= (rsi_ob - 5.0) {
+                score += 1;
+                reasons.push(format!(
+                    "15m เข้าเขต Overbought ร่วมด้วย (RSI {:.1})",
+                    state_15m.rsi
+                ));
+            } else if state_5m.vol_ratio >= 2.2 && state_15m.rsi <= 52.0 {
+                score += 1;
+                reasons.push(format!(
+                    "5m วอลุ่มเทขายหนาแน่น ({:.1}x)",
+                    state_5m.vol_ratio
+                ));
+            }
+        }
+        SignalDirection::Neutral => {}
+    }
+
+    let mut aligned_1h = false;
+    match direction {
+        SignalDirection::Bullish => {
+            if state_1h.trend == SignalDirection::Bullish {
+                score += 1;
+                aligned_1h = true;
+                reasons.push("ตามเทรนด์ใหญ่ 1h (ขาขึ้น)".to_string());
+            } else if is_reversal && state_1h.rsi <= (rsi_os + 6.0) {
+                score += 1;
+                aligned_1h = true;
+                reasons.push(format!("1h Oversold รอเด้งใหญ่ (RSI {:.1})", state_1h.rsi));
+            }
+        }
+        SignalDirection::Bearish => {
+            if state_1h.trend == SignalDirection::Bearish {
+                score += 1;
+                aligned_1h = true;
+                reasons.push("ตามเทรนด์ใหญ่ 1h (ขาลง)".to_string());
+            } else if is_reversal && state_1h.rsi >= (rsi_ob - 6.0) {
+                score += 1;
+                aligned_1h = true;
+                reasons.push(format!(
+                    "1h Overbought รอย่อใหญ่ (RSI {:.1})",
+                    state_1h.rsi
+                ));
+            }
+        }
+        SignalDirection::Neutral => {}
+    }
+
+    let stars = score.clamp(1, 3);
+    let grade = match stars {
+        3 => "⭐⭐⭐ (3/3 ดาว — A+ Setup สอดคล้องครบ 5m+15m+1h)".to_string(),
+        2 => {
+            if aligned_1h {
+                "⭐⭐ (2/3 ดาว — สัญญาณตามเทรนด์หลัก 1h)".to_string()
+            } else {
+                "⭐⭐ (2/3 ดาว — 5m+15m ยืนยันตรงกัน / สวนเทรนด์ 1h เน้นเก็บสั้น TP1-TP2)".to_string()
+            }
+        }
+        _ => "⭐ (1/3 ดาว — สัญญาณเดี่ยว ยังไม่ยืนยันข้าม TF)".to_string(),
+    };
+
+    (stars, grade, aligned_1h, reasons)
+}
+
+/// Appends Multi-Timeframe Summary + Entry (5m), SL (15m structure), and TP1/TP2/TP3 (5m/15m/1h) to signal details.
+pub fn append_mtf_trade_plan(
+    details: &mut Vec<(String, String)>,
+    direction: crate::models::SignalDirection,
+    price: f64,
+    state_5m: &TimeframeState,
+    state_15m: &TimeframeState,
+    state_1h: &TimeframeState,
+    candles_15m: &[Candle],
+    grade_str: &str,
+    aligned_1h: bool,
+    reasons: &[String],
+) {
+    use crate::models::SignalDirection;
+    use crate::notifier::format_price;
+
+    if price <= 0.0 || direction == SignalDirection::Neutral {
+        return;
+    }
+
+    details.push(("🏆 ความแม่นยำ".to_string(), grade_str.to_string()));
+    if !reasons.is_empty() {
+        details.push(("✨ เหตุผลหนุน".to_string(), reasons.join(" + ")));
+    }
+    details.push(("• TF 5m".to_string(), state_5m.label.clone()));
+    details.push(("• TF 15m".to_string(), state_15m.label.clone()));
+    details.push(("• TF 1h".to_string(), state_1h.label.clone()));
+
+    let atr_5m = if state_5m.atr > 0.0 {
+        state_5m.atr
+    } else {
+        price * 0.006
+    };
+    let atr_15m = if state_15m.atr > 0.0 {
+        state_15m.atr
+    } else {
+        price * 0.012
+    };
+    let atr_1h = if state_1h.atr > 0.0 {
+        state_1h.atr
+    } else {
+        price * 0.024
+    };
+
+    let mut raw_risk = atr_15m * 1.4;
+    if candles_15m.len() >= 6 {
+        let start = candles_15m.len().saturating_sub(8);
+        let recent_15m = &candles_15m[start..];
+        match direction {
+            SignalDirection::Bullish => {
+                if let Some(swing_low) = recent_15m
+                    .iter()
+                    .map(|c| c.low)
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    let swing_dist = (price - swing_low) + 0.20 * atr_15m;
+                    if swing_dist > 0.0 {
+                        raw_risk = raw_risk.max(swing_dist);
+                    }
+                }
+            }
+            SignalDirection::Bearish => {
+                if let Some(swing_high) = recent_15m
+                    .iter()
+                    .map(|c| c.high)
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    let swing_dist = (swing_high - price) + 0.20 * atr_15m;
+                    if swing_dist > 0.0 {
+                        raw_risk = raw_risk.max(swing_dist);
+                    }
+                }
+            }
+            SignalDirection::Neutral => {}
+        }
+    }
+
+    let min_risk = price * 0.007;
+    let max_risk = price * 0.048;
+    let risk = raw_risk.clamp(min_risk, max_risk);
+    let risk_pct = (risk / price) * 100.0;
+
+    let tp1_dist = (risk * 1.3).max(atr_5m * 2.2);
+    let tp2_dist = (risk * 2.3).max(atr_15m * 2.2);
+    let tp3_dist = (risk * 3.6).max(atr_1h * 1.8);
+
+    let side_note = if aligned_1h {
+        "ตามเทรนด์ 1h รันเทรนด์ได้"
+    } else {
+        "เล่นรอบสั้น เน้นแบ่งปิด TP1/TP2"
+    };
+
+    match direction {
+        SignalDirection::Bullish => {
+            let entry_low = price - 0.30 * atr_5m;
+            let sl = price - risk;
+            let tp1 = price + tp1_dist;
+            let tp2 = price + tp2_dist;
+            let tp3 = price + tp3_dist;
+            details.push((
+                "🧭 แผนเทรด".to_string(),
+                format!("🟢 เปิด LONG ({})", side_note),
+            ));
+            details.push((
+                "🎯 จุดเข้า (Entry)".to_string(),
+                format!(
+                    "${} - ${} (โซนรับ 5m)",
+                    format_price(entry_low),
+                    format_price(price)
+                ),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP1".to_string(),
+                format!(
+                    "${} (+{:.2}%) [เป้าสั้น 5m]",
+                    format_price(tp1),
+                    (tp1_dist / price) * 100.0
+                ),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP2".to_string(),
+                format!(
+                    "${} (+{:.2}%) [เป้ากลาง 15m]",
+                    format_price(tp2),
+                    (tp2_dist / price) * 100.0
+                ),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP3".to_string(),
+                format!(
+                    "${} (+{:.2}%) [เป้ารันเทรนด์ 1h]",
+                    format_price(tp3),
+                    (tp3_dist / price) * 100.0
+                ),
+            ));
+            details.push((
+                "🛡️ ตัดขาดทุน (SL)".to_string(),
+                format!("${} (-{:.2}%) [ใต้ฐาน 15m]", format_price(sl), risk_pct),
+            ));
+        }
+        SignalDirection::Bearish => {
+            let entry_high = price + 0.30 * atr_5m;
+            let sl = price + risk;
+            let tp1 = price - tp1_dist;
+            let tp2 = price - tp2_dist;
+            let tp3 = price - tp3_dist;
+            details.push((
+                "🧭 แผนเทรด".to_string(),
+                format!("🔴 เปิด SHORT ({})", side_note),
+            ));
+            details.push((
+                "🎯 จุดเข้า (Entry)".to_string(),
+                format!(
+                    "${} - ${} (โซนต้าน 5m)",
+                    format_price(price),
+                    format_price(entry_high)
+                ),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP1".to_string(),
+                format!(
+                    "${} (+{:.2}%) [เป้าสั้น 5m]",
+                    format_price(tp1),
+                    (tp1_dist / price) * 100.0
+                ),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP2".to_string(),
+                format!(
+                    "${} (+{:.2}%) [เป้ากลาง 15m]",
+                    format_price(tp2),
+                    (tp2_dist / price) * 100.0
+                ),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP3".to_string(),
+                format!(
+                    "${} (+{:.2}%) [เป้ารันเทรนด์ 1h]",
+                    format_price(tp3),
+                    (tp3_dist / price) * 100.0
+                ),
+            ));
+            details.push((
+                "🛡️ ตัดขาดทุน (SL)".to_string(),
+                format!("${} (-{:.2}%) [เหนือต้าน 15m]", format_price(sl), risk_pct),
+            ));
+        }
+        SignalDirection::Neutral => {}
+    }
+}
+
 /// Appends Entry Zone, TP1 (1.5R), TP2 (2.5R), and Stop Loss (SL) details based on ATR and Swing High/Low.
 pub fn append_trade_plan(
     details: &mut Vec<(String, String)>,
