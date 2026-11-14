@@ -62,6 +62,28 @@
 
 ---
 
+## 📱 วิธีรันในมือถือแบบง่ายที่สุด (ไม่ติดบล็อก IP 100%)
+
+เนื่องจากอินเทอร์เน็ตมือถือในไทยสามารถเชื่อมต่อ Binance Futures (`fapi.binance.com`) ได้โดยตรงแบบไม่ติดบล็อก คุณสามารถรันสแกนเนอร์ผ่านมือถือได้ทันที:
+
+### สำหรับ Android (ผ่านแอป Termux) — ก๊อปปี้คำสั่งเดียวรันได้เลย
+เปิดแอป **Termux** แล้ววางคำสั่งนี้:
+```bash
+curl -sL https://raw.githubusercontent.com/purinus0341-ai/Scanner-f/main/termux-run.sh | bash
+```
+- สคริปต์จะถามค่า `Telegram Bot Token` / `Chat ID` / `Discord Webhook` (หรือกด Enter ข้ามเพื่อดูผลแจ้งเตือนสดบนหน้าจอมือถือได้เลย)
+- เปิด `termux-wake-lock` ให้อัตโนมัติเพื่อให้สแกนต่อได้แม้ปิดหน้าจอมือถือ
+- มีให้เลือกทั้ง **โหมดรันทันที (`mobile_scanner.py`)** ไม่ต้องรอคอมไพล์ และ **โหมด Rust เต็มรูปแบบ (`cargo build --release`)**
+
+### สำหรับ iPhone / iPad (ผ่านแอป a-Shell หรือ Pythonista) หรือแอป Python บนมือถือ
+ดาวน์โหลดและรันไฟล์ [`mobile_scanner.py`](mobile_scanner.py) ได้ทันทีโดยไม่ต้องติดตั้งไลบรารีเสริม (`pip`):
+```bash
+curl -sLO https://raw.githubusercontent.com/purinus0341-ai/Scanner-f/main/mobile_scanner.py
+python3 mobile_scanner.py
+```
+
+---
+
 ## 💻 วิธีรันบนเครื่องหรือเซิร์ฟเวอร์ส่วนตัว (Local / VPS)
 
 ```bash
@@ -77,3 +99,4 @@ cargo run --release -- --once
 # 4. รันสแกนแบบเรียลไทม์ 24/7
 cargo run --release
 ```
+

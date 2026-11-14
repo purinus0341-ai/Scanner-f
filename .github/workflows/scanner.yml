@@ -31,10 +31,6 @@ on:
           - 1h
           - 4h
 
-  # รันอัตโนมัติทุกๆ 15 นาทีในโหมด --once
-  schedule:
-    - cron: "*/15 * * * *"
-
 concurrency:
   group: scanner-f-runtime
   cancel-in-progress: false
