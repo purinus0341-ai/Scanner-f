@@ -14,8 +14,8 @@ use crate::binance::{
 };
 use crate::config::ScannerConfig;
 use crate::indicators::{
-    calculate_bollinger_bands, calculate_rsi, calculate_volume_ratio, detect_ema_crossover,
-    CrossoverType,
+    append_trade_plan, calculate_bollinger_bands, calculate_rsi, calculate_volume_ratio,
+    detect_ema_crossover, CrossoverType,
 };
 use crate::models::{
     Candle, ScanSignal, SignalCategory, SignalDirection, Ticker24hr, WsForceOrderEvent,
@@ -608,6 +608,10 @@ impl FuturesScanner {
             }
         }
 
+        for sig in &mut signals {
+            append_trade_plan(&mut sig.details, sig.direction, sig.price, Some(candles));
+        }
+
         signals
     }
 
@@ -648,6 +652,11 @@ impl FuturesScanner {
             };
 
             let mark_price = item.mark_price_f64();
+            let mut details = vec![
+                ("Funding Rate".to_string(), format!("{:+.4}%", fr_pct)),
+                ("Mark Price".to_string(), format!("${}", format_price(mark_price))),
+            ];
+            append_trade_plan(&mut details, direction, mark_price, None);
 
             let sig = ScanSignal {
                 symbol: item.symbol,
@@ -658,10 +667,7 @@ impl FuturesScanner {
                 quote_volume_24h: vol_24h,
                 timeframe: "Funding".to_string(),
                 metric_summary: format!("Funding Rate = {:+.4}% ({})", fr_pct, note),
-                details: vec![
-                    ("Funding Rate".to_string(), format!("{:+.4}%", fr_pct)),
-                    ("Mark Price".to_string(), format!("${}", format_price(mark_price))),
-                ],
+                details,
                 timestamp: Utc::now(),
             };
 

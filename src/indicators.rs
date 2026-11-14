@@ -197,6 +197,157 @@ pub fn calculate_volume_ratio(candles: &[Candle], lookback: usize) -> Option<(f6
     Some((ratio, avg_quote_vol))
 }
 
+/// Calculates Average True Range (ATR) over `period` candles.
+pub fn calculate_atr(candles: &[Candle], period: usize) -> Option<f64> {
+    if period == 0 || candles.len() < 2 {
+        return None;
+    }
+
+    let mut trs = Vec::with_capacity(candles.len() - 1);
+    for i in 1..candles.len() {
+        let h = candles[i].high;
+        let l = candles[i].low;
+        let prev_c = candles[i - 1].close;
+        let tr = (h - l).max((h - prev_c).abs()).max((l - prev_c).abs());
+        trs.push(tr);
+    }
+
+    if trs.is_empty() {
+        return None;
+    }
+
+    let window = if trs.len() >= period {
+        &trs[trs.len() - period..]
+    } else {
+        &trs[..]
+    };
+
+    Some(window.iter().sum::<f64>() / (window.len() as f64))
+}
+
+/// Appends Entry Zone, TP1 (1.5R), TP2 (2.5R), and Stop Loss (SL) details based on ATR and Swing High/Low.
+pub fn append_trade_plan(
+    details: &mut Vec<(String, String)>,
+    direction: crate::models::SignalDirection,
+    price: f64,
+    candles: Option<&[Candle]>,
+) {
+    use crate::models::SignalDirection;
+    use crate::notifier::format_price;
+
+    if price <= 0.0 || direction == SignalDirection::Neutral {
+        return;
+    }
+
+    let atr = candles
+        .and_then(|c| calculate_atr(c, 14))
+        .filter(|&v| v > 0.0)
+        .unwrap_or(price * 0.012);
+
+    let mut raw_risk = atr * 1.5;
+
+    if let Some(c_slice) = candles {
+        if c_slice.len() >= 6 {
+            let start = c_slice.len().saturating_sub(10);
+            let recent = &c_slice[start..];
+            match direction {
+                SignalDirection::Bullish => {
+                    if let Some(swing_low) = recent
+                        .iter()
+                        .map(|c| c.low)
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    {
+                        let swing_dist = (price - swing_low) + 0.25 * atr;
+                        if swing_dist > 0.0 {
+                            raw_risk = raw_risk.max(swing_dist);
+                        }
+                    }
+                }
+                SignalDirection::Bearish => {
+                    if let Some(swing_high) = recent
+                        .iter()
+                        .map(|c| c.high)
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    {
+                        let swing_dist = (swing_high - price) + 0.25 * atr;
+                        if swing_dist > 0.0 {
+                            raw_risk = raw_risk.max(swing_dist);
+                        }
+                    }
+                }
+                SignalDirection::Neutral => {}
+            }
+        }
+    }
+
+    let min_risk = price * 0.006; // 0.6%
+    let max_risk = price * 0.045; // 4.5%
+    let risk = raw_risk.clamp(min_risk, max_risk);
+    let risk_pct = (risk / price) * 100.0;
+
+    match direction {
+        SignalDirection::Bullish => {
+            let entry_low = price - 0.25 * atr;
+            let sl = price - risk;
+            let tp1 = price + risk * 1.5;
+            let tp2 = price + risk * 2.5;
+            let tp1_pct = ((tp1 - price) / price) * 100.0;
+            let tp2_pct = ((tp2 - price) / price) * 100.0;
+
+            details.push((
+                "🧭 แผนเทรด".to_string(),
+                "🟢 เปิด LONG (เก็งกำไรขาขึ้น)".to_string(),
+            ));
+            details.push((
+                "🎯 จุดเข้า (Entry)".to_string(),
+                format!("${} - ${}", format_price(entry_low), format_price(price)),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP1".to_string(),
+                format!("${} (+{:.2}%)", format_price(tp1), tp1_pct),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP2".to_string(),
+                format!("${} (+{:.2}%)", format_price(tp2), tp2_pct),
+            ));
+            details.push((
+                "🛡️ ตัดขาดทุน (SL)".to_string(),
+                format!("${} (-{:.2}%)", format_price(sl), risk_pct),
+            ));
+        }
+        SignalDirection::Bearish => {
+            let entry_high = price + 0.25 * atr;
+            let sl = price + risk;
+            let tp1 = price - risk * 1.5;
+            let tp2 = price - risk * 2.5;
+            let tp1_pct = ((price - tp1) / price) * 100.0;
+            let tp2_pct = ((price - tp2) / price) * 100.0;
+
+            details.push((
+                "🧭 แผนเทรด".to_string(),
+                "🔴 เปิด SHORT (เก็งกำไรขาลง)".to_string(),
+            ));
+            details.push((
+                "🎯 จุดเข้า (Entry)".to_string(),
+                format!("${} - ${}", format_price(price), format_price(entry_high)),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP1".to_string(),
+                format!("${} (+{:.2}%)", format_price(tp1), tp1_pct),
+            ));
+            details.push((
+                "💰 เป้าทำกำไร TP2".to_string(),
+                format!("${} (+{:.2}%)", format_price(tp2), tp2_pct),
+            ));
+            details.push((
+                "🛡️ ตัดขาดทุน (SL)".to_string(),
+                format!("${} (-{:.2}%)", format_price(sl), risk_pct),
+            ));
+        }
+        SignalDirection::Neutral => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

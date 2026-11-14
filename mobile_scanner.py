@@ -2,10 +2,11 @@
 """
 📱 Scanner-f Mobile Edition (Zero-Dependency Python 3 Script)
 รันได้ทันทีบนมือถือทุกรุ่น (Android: Termux / Pydroid 3, iOS: a-Shell / Pythonista)
-ไม่ต้องติดตั้งไลบรารีเพิ่ม (ใช้ Standard Library ล้วน) และเน็ตมือถือไทยเชื่อม Binance ได้ตรงๆ ไม่ติดบล็อก!
+พร้อมคำนวณจุดเข้า (Entry), เป้าทำกำไร (TP1 / TP2) และจุดตัดขาดทุน (Stop Loss) อัตโนมัติด้วย ATR & Swing High/Low
 """
 
 import concurrent.futures
+import html
 import json
 import math
 import os
@@ -56,7 +57,6 @@ BB_STD = float(os.environ.get("BB_STD_DEV", "2.0"))
 BB_MIN_VOL_RATIO = float(os.environ.get("BB_MIN_VOLUME_RATIO", "1.8"))
 
 FUNDING_THRESHOLD_PCT = float(os.environ.get("FUNDING_RATE_THRESHOLD_PCT", "0.10"))
-OI_SPIKE_PCT = float(os.environ.get("OI_SPIKE_THRESHOLD_PCT", "3.0"))
 SCAN_INTERVAL_SECS = int(os.environ.get("FUTURES_POLL_INTERVAL_SECS", "60"))
 ALERT_COOLDOWN_SECS = int(os.environ.get("ALERT_COOLDOWN_SECS", "900"))
 
@@ -65,13 +65,12 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
 cooldown_cache = {}
-previous_oi = {}
 
 
 def http_get_json(url, timeout=12):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "scanner-f-mobile/1.0"},
+        headers={"User-Agent": "scanner-f-mobile/1.1"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -84,12 +83,20 @@ def http_post_json(url, payload, timeout=10):
         data=data,
         headers={
             "Content-Type": "application/json",
-            "User-Agent": "scanner-f-mobile/1.0",
+            "User-Agent": "scanner-f-mobile/1.1",
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {err_body or e.reason}") from e
 
 
 def fmt_price(p):
@@ -162,7 +169,101 @@ def calc_bollinger(closes, period=20, std_mult=2.0):
     return mean + std_mult * sd, mean, mean - std_mult * sd
 
 
-def dispatch_alert(symbol, category_key, title_th, direction, price, chg24, vol24, tf, summary, details, force=False):
+def calc_atr(candles, period=14):
+    if len(candles) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]
+        l = candles[i]["low"]
+        prev_c = candles[i - 1]["close"]
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        trs.append(tr)
+    if not trs:
+        return 0.0
+    window = trs[-period:] if len(trs) >= period else trs
+    return sum(window) / len(window)
+
+
+def build_trade_plan(direction, price, candles=None):
+    """
+    คำนวณแผนเทรด: จุดเข้า (Entry), จุดตัดขาดทุน (SL), และเป้าทำกำไร (TP1 1.5R, TP2 2.5R)
+    โดยอิงจากค่า ATR(14) และแนวรับ/แนวต้าน (Swing High/Low) ล่าสุด
+    """
+    if price <= 0:
+        return None
+
+    atr = calc_atr(candles, 14) if candles else 0.0
+    if atr <= 0:
+        atr = price * 0.012  # fallback 1.2%
+
+    # ระยะความเสี่ยง (Risk Distance) มาตรฐาน = 1.5 * ATR
+    # จำกัดขอบเขตความเสี่ยงให้อยู่ระหว่าง 0.6% ถึง 4.5% ของราคาปัจจุบัน
+    raw_risk = atr * 1.5
+    if candles and len(candles) >= 6:
+        recent = candles[-10:] if len(candles) >= 10 else candles
+        if direction == "BULL":
+            swing_low = min(c["low"] for c in recent)
+            swing_dist = (price - swing_low) + (0.25 * atr)
+            if swing_dist > 0:
+                raw_risk = max(raw_risk, swing_dist)
+        elif direction == "BEAR":
+            swing_high = max(c["high"] for c in recent)
+            swing_dist = (swing_high - price) + (0.25 * atr)
+            if swing_dist > 0:
+                raw_risk = max(raw_risk, swing_dist)
+
+    min_risk = price * 0.006  # ขั้นต่ำ 0.6%
+    max_risk = price * 0.045  # สูงสุด 4.5%
+    risk = max(min_risk, min(max_risk, raw_risk))
+    risk_pct = (risk / price) * 100.0
+
+    if direction == "BULL":
+        entry_low = price - (0.25 * atr)
+        sl = price - risk
+        tp1 = price + (risk * 1.5)
+        tp2 = price + (risk * 2.5)
+        tp1_pct = ((tp1 - price) / price) * 100.0
+        tp2_pct = ((tp2 - price) / price) * 100.0
+        return {
+            "side_label": "🟢 เปิด LONG (เก็งกำไรขาขึ้น)",
+            "entry_str": f"${fmt_price(entry_low)} - ${fmt_price(price)}",
+            "tp1_str": f"${fmt_price(tp1)} (+{tp1_pct:.2f}%)",
+            "tp2_str": f"${fmt_price(tp2)} (+{tp2_pct:.2f}%)",
+            "sl_str": f"${fmt_price(sl)} (-{risk_pct:.2f}%)",
+            "rr_str": "1 : 1.5 / 1 : 2.5",
+        }
+    else:
+        entry_high = price + (0.25 * atr)
+        sl = price + risk
+        tp1 = price - (risk * 1.5)
+        tp2 = price - (risk * 2.5)
+        tp1_pct = ((price - tp1) / price) * 100.0
+        tp2_pct = ((price - tp2) / price) * 100.0
+        return {
+            "side_label": "🔴 เปิด SHORT (เก็งกำไรขาลง)",
+            "entry_str": f"${fmt_price(price)} - ${fmt_price(entry_high)}",
+            "tp1_str": f"${fmt_price(tp1)} (+{tp1_pct:.2f}%)",
+            "tp2_str": f"${fmt_price(tp2)} (+{tp2_pct:.2f}%)",
+            "sl_str": f"${fmt_price(sl)} (-{risk_pct:.2f}%)",
+            "rr_str": "1 : 1.5 / 1 : 2.5",
+        }
+
+
+def dispatch_alert(
+    symbol,
+    category_key,
+    title_th,
+    direction,
+    price,
+    chg24,
+    vol24,
+    tf,
+    summary,
+    details,
+    candles=None,
+    force=False,
+):
     now = time.time()
     cd_key = f"{symbol}:{category_key}"
     if not force:
@@ -171,6 +272,8 @@ def dispatch_alert(symbol, category_key, title_th, direction, price, chg24, vol2
             return
         cooldown_cache[cd_key] = now
 
+    plan = build_trade_plan(direction, price, candles)
+
     ts_str = datetime.now().strftime("%H:%M:%S")
     detail_str = " | ".join(f"{k}={v}" for k, v in details)
     print(f"\n🔔 [{ts_str}] {title_th}")
@@ -178,20 +281,34 @@ def dispatch_alert(symbol, category_key, title_th, direction, price, chg24, vol2
     print(f"   📌 {summary}")
     if detail_str:
         print(f"   📊 {detail_str}")
+    if plan:
+        print(f"   🧭 แผนเทรด : {plan['side_label']}")
+        print(f"   🎯 จุดเข้า (Entry) : {plan['entry_str']}")
+        print(f"   💰 เป้า TP1 / TP2  : {plan['tp1_str']}  |  {plan['tp2_str']}")
+        print(f"   🛡️ ตัดขาดทุน (SL)  : {plan['sl_str']}  (R:R {plan['rr_str']})")
 
     futures_url = f"https://www.binance.com/en/futures/{symbol}"
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         lines = [
-            f"<b>{title_th}</b>",
-            f"🪙 เหรียญ: <b>#{symbol}</b> (TF: <code>{tf}</code>)",
+            f"<b>{html.escape(title_th)}</b>",
+            f"🪙 เหรียญ: <b>#{html.escape(symbol)}</b> (TF: <code>{html.escape(tf)}</code>)",
             f"💵 ราคาปัจจุบัน: <code>${fmt_price(price)}</code>",
             f"📊 24h Change: <code>{chg24:+.2f}%</code> | 💧 Vol: <code>${fmt_usd(vol24)}</code>",
-            f"📌 สัญญาณ: <b>{summary}</b>",
+            f"📌 สัญญาณ: <b>{html.escape(summary)}</b>",
         ]
         for k, v in details:
-            lines.append(f"• {k}: <code>{v}</code>")
-        lines.append(f"\n🔗 <a href=\"{futures_url}\">เปิดกราฟ Binance Futures ({symbol})</a>")
+            lines.append(f"• {html.escape(str(k))}: <code>{html.escape(str(v))}</code>")
+
+        if plan:
+            lines.append("")
+            lines.append(f"🧭 <b>แผนเทรด: {html.escape(plan['side_label'])}</b>")
+            lines.append(f"🎯 จุดเข้า (Entry): <code>{html.escape(plan['entry_str'])}</code>")
+            lines.append(f"💰 เป้าทำกำไร TP1: <code>{html.escape(plan['tp1_str'])}</code>")
+            lines.append(f"💰 เป้าทำกำไร TP2: <code>{html.escape(plan['tp2_str'])}</code>")
+            lines.append(f"🛡️ จุดตัดขาดทุน SL: <code>{html.escape(plan['sl_str'])}</code>")
+
+        lines.append(f"\n🔗 <a href=\"{futures_url}\">เปิดกราฟ Binance Futures ({html.escape(symbol)})</a>")
         try:
             http_post_json(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -213,8 +330,17 @@ def dispatch_alert(symbol, category_key, title_th, direction, price, chg24, vol2
             {"name": "📊 24h Change / Vol", "value": f"`{chg24:+.2f}%` / `${fmt_usd(vol24)}`", "inline": True},
             {"name": "📌 สัญญาณ", "value": f"**{summary}**", "inline": False},
         ]
+        if plan:
+            fields.extend(
+                [
+                    {"name": "🧭 ทิศทาง", "value": f"**{plan['side_label']}**", "inline": False},
+                    {"name": "🎯 จุดเข้า (Entry)", "value": f"`{plan['entry_str']}`", "inline": True},
+                    {"name": "🛡️ ตัดขาดทุน (SL)", "value": f"`{plan['sl_str']}`", "inline": True},
+                    {"name": "💰 เป้าทำกำไร (TP1 / TP2)", "value": f"TP1: `{plan['tp1_str']}`\nTP2: `{plan['tp2_str']}`", "inline": False},
+                ]
+            )
         for k, v in details:
-            fields.append({"name": k, "value": f"`{v}`", "inline": True})
+            fields.append({"name": str(k), "value": f"`{v}`", "inline": True})
         try:
             http_post_json(
                 DISCORD_WEBHOOK_URL,
@@ -346,6 +472,7 @@ def scan_once():
                     KLINE_INTERVAL,
                     f"ราคาพุ่ง +{chg_pct:.2f}% ในแท่ง {KLINE_INTERVAL}",
                     [("Volume Ratio", f"{vol_ratio:.2f}x"), ("Open -> Now", f"${fmt_price(open_p)} -> ${fmt_price(close_p)}")],
+                    candles=candles,
                 )
             elif chg_pct <= -PRICE_CHANGE_PCT:
                 dispatch_alert(
@@ -359,6 +486,7 @@ def scan_once():
                     KLINE_INTERVAL,
                     f"ราคาทุบ {chg_pct:.2f}% ในแท่ง {KLINE_INTERVAL}",
                     [("Volume Ratio", f"{vol_ratio:.2f}x"), ("Open -> Now", f"${fmt_price(open_p)} -> ${fmt_price(close_p)}")],
+                    candles=candles,
                 )
 
             # Volume Spike
@@ -374,6 +502,7 @@ def scan_once():
                     KLINE_INTERVAL,
                     f"วอลุ่มพุ่ง {vol_ratio:.2f} เท่าของค่าเฉลี่ย ({chg_pct:+.2f}%)",
                     [("Volume แท่งนี้", f"${fmt_usd(latest['quote_vol'])}"), ("ค่าเฉลี่ย", f"${fmt_usd(avg_vol)}")],
+                    candles=candles,
                 )
 
             # อินดิเคเตอร์คำนวณจากแท่งที่ปิดแล้ว
@@ -397,8 +526,9 @@ def scan_once():
                         meta["chg24"],
                         meta["vol24"],
                         KLINE_INTERVAL,
-                        f"RSI({RSI_PERIOD}) = {rsi:.2f} (>= {RSI_OB:.0f})",
+                        f"RSI({RSI_PERIOD}) = {rsi:.2f} (Overbought >= {RSI_OB:.0f})",
                         [(f"RSI({RSI_PERIOD})", f"{rsi:.2f}")],
+                        candles=closed_candles,
                     )
                 elif rsi <= RSI_OS:
                     dispatch_alert(
@@ -410,8 +540,9 @@ def scan_once():
                         meta["chg24"],
                         meta["vol24"],
                         KLINE_INTERVAL,
-                        f"RSI({RSI_PERIOD}) = {rsi:.2f} (<= {RSI_OS:.0f})",
+                        f"RSI({RSI_PERIOD}) = {rsi:.2f} (Oversold <= {RSI_OS:.0f})",
                         [(f"RSI({RSI_PERIOD})", f"{rsi:.2f}")],
+                        candles=closed_candles,
                     )
 
             # EMA Crossover
@@ -430,6 +561,7 @@ def scan_once():
                         KLINE_INTERVAL,
                         f"EMA({EMA_FAST}) ตัดขึ้นเหนือ EMA({EMA_SLOW})",
                         [(f"EMA({EMA_FAST})", fmt_price(fast_emas[-1])), (f"EMA({EMA_SLOW})", fmt_price(slow_emas[-1]))],
+                        candles=closed_candles,
                     )
                 elif fast_emas[-2] >= slow_emas[-2] and fast_emas[-1] < slow_emas[-1]:
                     dispatch_alert(
@@ -443,6 +575,7 @@ def scan_once():
                         KLINE_INTERVAL,
                         f"EMA({EMA_FAST}) ตัดลงต่ำกว่า EMA({EMA_SLOW})",
                         [(f"EMA({EMA_FAST})", fmt_price(fast_emas[-1])), (f"EMA({EMA_SLOW})", fmt_price(slow_emas[-1]))],
+                        candles=closed_candles,
                     )
 
             # Bollinger Bands Breakout
@@ -461,6 +594,7 @@ def scan_once():
                         KLINE_INTERVAL,
                         f"ราคาปิดทะลุ Upper BB พร้อมวอลุ่ม {vol_ratio:.2f}x",
                         [("Upper BB", f"${fmt_price(upper)}"), ("Volume Ratio", f"{vol_ratio:.2f}x")],
+                        candles=closed_candles,
                     )
                 elif eval_price < lower:
                     dispatch_alert(
@@ -474,6 +608,7 @@ def scan_once():
                         KLINE_INTERVAL,
                         f"ราคาปิดหลุด Lower BB พร้อมวอลุ่ม {vol_ratio:.2f}x",
                         [("Lower BB", f"${fmt_price(lower)}"), ("Volume Ratio", f"{vol_ratio:.2f}x")],
+                        candles=closed_candles,
                     )
 
 
@@ -494,8 +629,8 @@ def main():
             4.85,
             18_500_000_000.0,
             KLINE_INTERVAL,
-            "ระบบสแกนเนอร์บนมือถือพร้อมทำงาน!",
-            [("RSI(14)", "76.40"), ("EMA(9/21)", "Golden Cross")],
+            "RSI(14) = 23.13 (Oversold <= 25) พร้อมสัญญาณกลับตัว",
+            [("RSI(14)", "23.13"), ("EMA(9/21)", "Golden Cross")],
             force=True,
         )
         return
