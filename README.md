@@ -34,17 +34,25 @@
 
 โปรเจกต์นี้มีไฟล์เวิร์กโฟลว์ [`.github/workflows/scanner.yml`](.github/workflows/scanner.yml) พร้อมใช้งานทันที:
 
-### ขั้นตอนที่ 1: ตั้งค่า GitHub Secrets สำหรับแจ้งเตือน
+### ขั้นตอนที่ 1: ตั้งค่า Reverse Proxy นอกสหรัฐฯ (แก้ HTTP 451 บน GitHub Runner)
+เนื่องจาก GitHub Actions Runner ตั้งอยู่ในสหรัฐอเมริกา จึงถูก Binance Futures บล็อก (`HTTP 451`) ให้นำไฟล์ Reverse Proxy ในโฟลเดอร์ `proxy/` ไป Deploy บนเซิร์ฟเวอร์หรือบริการนอกสหรัฐฯ (แนะนำภูมิภาค **สิงคโปร์ / ญี่ปุ่น / ยุโรป**):
+- **Deno / Fly.io (แนะนำ สำหรับรองรับทั้ง REST & WebSocket)**: ใช้ [`proxy/deno-proxy.ts`](proxy/deno-proxy.ts)
+- **VPS (Nginx)**: ใช้ [`proxy/nginx.conf`](proxy/nginx.conf)
+- **Cloudflare Workers**: ใช้ [`proxy/cloudflare-worker.js`](proxy/cloudflare-worker.js) *(หมายเหตุ: Free Plan ของ Cloudflare มักรัน Worker ที่ Edge PoP ใกล้ตัว GitHub Runner ในสหรัฐฯ ซึ่งอาจยังติด 451 จาก Binance ได้ หากใช้ Cloudflare แนะนำเปิด Smart Placement หรือใช้ VPS/Fly.io โซนสิงคโปร์แทน)*
+
+### ขั้นตอนที่ 2: ตั้งค่า GitHub Secrets สำหรับแจ้งเตือนและ Proxy
 ไปที่หน้า Repository บน GitHub → **Settings** → **Secrets and variables** → **Actions** → กด **New repository secret** แล้วเพิ่มค่าที่คุณต้องการใช้:
 
 | ชื่อ Secret | คำอธิบาย |
 | :--- | :--- |
+| `BINANCE_FAPI_URL` | URL ของ Reverse Proxy สำหรับ REST API (เช่น `https://your-proxy.example.com`) |
+| `BINANCE_FSTREAM_URL` | URL ของ Reverse Proxy สำหรับ WebSocket (เช่น `wss://your-proxy.example.com`) |
 | `TELEGRAM_BOT_TOKEN` | Token ของ Telegram Bot จาก `@BotFather` (เช่น `123456:ABC-DEF...`) |
 | `TELEGRAM_CHAT_ID` | Chat ID หรือ Channel/Group ID ที่ต้องการให้บอทส่งแจ้งเตือน |
 | `DISCORD_WEBHOOK_URL` | Webhook URL ของห้อง Discord ที่ต้องการรับแจ้งเตือน |
-| `HTTPS_PROXY` *(ทางเลือก)* | หาก IP ของ GitHub Actions US Runner ถูก Binance บล็อก (`HTTP 451`) สามารถใส่ Proxy นอกสหรัฐฯ ได้ |
+| `HTTPS_PROXY` *(ทางเลือก)* | กรณีใช้ HTTP/HTTPS Proxy แทน Reverse Proxy |
 
-### ขั้นตอนที่ 2: กดรันจากแท็บ Actions บน GitHub
+### ขั้นตอนที่ 3: กดรันจากแท็บ Actions บน GitHub
 1. ไปที่แท็บ **Actions** ของ Repository บน GitHub
 2. เลือกเวิร์กโฟลว์ **Binance Futures Scanner (Scanner-f)** ด้านซ้ายมือ
 3. กดปุ่ม **Run workflow** แล้วเลือกโหมดที่ต้องการ:

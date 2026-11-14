@@ -68,8 +68,12 @@ impl ScannerConfig {
         let _ = dotenvy::dotenv();
 
         Self {
-            rest_base_url: env_string("BINANCE_FAPI_URL", "https://fapi.binance.com"),
-            ws_base_url: env_string("BINANCE_FSTREAM_URL", "wss://fstream.binance.com"),
+            rest_base_url: env_string("BINANCE_FAPI_URL", "https://fapi.binance.com")
+                .trim_end_matches('/')
+                .to_string(),
+            ws_base_url: env_string("BINANCE_FSTREAM_URL", "wss://fstream.binance.com")
+                .trim_end_matches('/')
+                .to_string(),
 
             min_quote_volume_24h: env_f64("MIN_QUOTE_VOLUME_24H", 20_000_000.0),
             max_symbols: env_usize("MAX_SYMBOLS", 150),
