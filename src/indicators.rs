@@ -423,33 +423,34 @@ pub fn evaluate_mtf_confluence(
     (stars, grade, aligned_1h, reasons)
 }
 
-/// Appends Multi-Timeframe Summary + Entry (5m), SL (15m structure), and TP1/TP2/TP3 (5m/15m/1h) to signal details.
-pub fn append_mtf_trade_plan(
-    details: &mut Vec<(String, String)>,
+#[derive(Debug, Clone, Copy)]
+pub struct MtfTradeLevels {
+    pub entry_price: f64,
+    pub entry_band: f64,
+    pub sl: f64,
+    pub tp1: f64,
+    pub tp2: f64,
+    pub tp3: f64,
+    pub risk_pct: f64,
+    pub tp1_pct: f64,
+    pub tp2_pct: f64,
+    pub tp3_pct: f64,
+}
+
+/// Computes Entry, SL (15m structure), and TP1/TP2/TP3 (5m/15m/1h) levels.
+pub fn compute_mtf_trade_levels(
     direction: crate::models::SignalDirection,
     price: f64,
     state_5m: &TimeframeState,
     state_15m: &TimeframeState,
     state_1h: &TimeframeState,
     candles_15m: &[Candle],
-    grade_str: &str,
-    aligned_1h: bool,
-    reasons: &[String],
-) {
+) -> Option<MtfTradeLevels> {
     use crate::models::SignalDirection;
-    use crate::notifier::format_price;
 
     if price <= 0.0 || direction == SignalDirection::Neutral {
-        return;
+        return None;
     }
-
-    details.push(("🏆 ความแม่นยำ".to_string(), grade_str.to_string()));
-    if !reasons.is_empty() {
-        details.push(("✨ เหตุผลหนุน".to_string(), reasons.join(" + ")));
-    }
-    details.push(("• TF 5m".to_string(), state_5m.label.clone()));
-    details.push(("• TF 15m".to_string(), state_15m.label.clone()));
-    details.push(("• TF 1h".to_string(), state_1h.label.clone()));
 
     let atr_5m = if state_5m.atr > 0.0 {
         state_5m.atr
@@ -509,6 +510,73 @@ pub fn append_mtf_trade_plan(
     let tp2_dist = (risk * 2.3).max(atr_15m * 2.2);
     let tp3_dist = (risk * 3.6).max(atr_1h * 1.8);
 
+    let tp1_pct = (tp1_dist / price) * 100.0;
+    let tp2_pct = (tp2_dist / price) * 100.0;
+    let tp3_pct = (tp3_dist / price) * 100.0;
+
+    match direction {
+        SignalDirection::Bullish => Some(MtfTradeLevels {
+            entry_price: price,
+            entry_band: price - 0.30 * atr_5m,
+            sl: price - risk,
+            tp1: price + tp1_dist,
+            tp2: price + tp2_dist,
+            tp3: price + tp3_dist,
+            risk_pct,
+            tp1_pct,
+            tp2_pct,
+            tp3_pct,
+        }),
+        SignalDirection::Bearish => Some(MtfTradeLevels {
+            entry_price: price,
+            entry_band: price + 0.30 * atr_5m,
+            sl: price + risk,
+            tp1: price - tp1_dist,
+            tp2: price - tp2_dist,
+            tp3: price - tp3_dist,
+            risk_pct,
+            tp1_pct,
+            tp2_pct,
+            tp3_pct,
+        }),
+        SignalDirection::Neutral => None,
+    }
+}
+
+/// Appends Multi-Timeframe Summary + Entry (5m), SL (15m structure), and TP1/TP2/TP3 (5m/15m/1h) to signal details.
+#[allow(clippy::too_many_arguments)]
+pub fn append_mtf_trade_plan(
+    details: &mut Vec<(String, String)>,
+    direction: crate::models::SignalDirection,
+    price: f64,
+    state_5m: &TimeframeState,
+    state_15m: &TimeframeState,
+    state_1h: &TimeframeState,
+    candles_15m: &[Candle],
+    grade_str: &str,
+    aligned_1h: bool,
+    reasons: &[String],
+) -> Option<MtfTradeLevels> {
+    use crate::models::SignalDirection;
+    use crate::notifier::format_price;
+
+    let levels = compute_mtf_trade_levels(
+        direction,
+        price,
+        state_5m,
+        state_15m,
+        state_1h,
+        candles_15m,
+    )?;
+
+    details.push(("🏆 ความแม่นยำ".to_string(), grade_str.to_string()));
+    if !reasons.is_empty() {
+        details.push(("✨ เหตุผลหนุน".to_string(), reasons.join(" + ")));
+    }
+    details.push(("• TF 5m".to_string(), state_5m.label.clone()));
+    details.push(("• TF 15m".to_string(), state_15m.label.clone()));
+    details.push(("• TF 1h".to_string(), state_1h.label.clone()));
+
     let side_note = if aligned_1h {
         "ตามเทรนด์ 1h รันเทรนด์ได้"
     } else {
@@ -517,11 +585,6 @@ pub fn append_mtf_trade_plan(
 
     match direction {
         SignalDirection::Bullish => {
-            let entry_low = price - 0.30 * atr_5m;
-            let sl = price - risk;
-            let tp1 = price + tp1_dist;
-            let tp2 = price + tp2_dist;
-            let tp3 = price + tp3_dist;
             details.push((
                 "🧭 แผนเทรด".to_string(),
                 format!("🟢 เปิด LONG ({})", side_note),
@@ -530,45 +593,44 @@ pub fn append_mtf_trade_plan(
                 "🎯 จุดเข้า (Entry)".to_string(),
                 format!(
                     "${} - ${} (โซนรับ 5m)",
-                    format_price(entry_low),
-                    format_price(price)
+                    format_price(levels.entry_band),
+                    format_price(levels.entry_price)
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP1".to_string(),
                 format!(
                     "${} (+{:.2}%) [เป้าสั้น 5m]",
-                    format_price(tp1),
-                    (tp1_dist / price) * 100.0
+                    format_price(levels.tp1),
+                    levels.tp1_pct
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP2".to_string(),
                 format!(
                     "${} (+{:.2}%) [เป้ากลาง 15m]",
-                    format_price(tp2),
-                    (tp2_dist / price) * 100.0
+                    format_price(levels.tp2),
+                    levels.tp2_pct
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP3".to_string(),
                 format!(
                     "${} (+{:.2}%) [เป้ารันเทรนด์ 1h]",
-                    format_price(tp3),
-                    (tp3_dist / price) * 100.0
+                    format_price(levels.tp3),
+                    levels.tp3_pct
                 ),
             ));
             details.push((
                 "🛡️ ตัดขาดทุน (SL)".to_string(),
-                format!("${} (-{:.2}%) [ใต้ฐาน 15m]", format_price(sl), risk_pct),
+                format!(
+                    "${} (-{:.2}%) [ใต้ฐาน 15m]",
+                    format_price(levels.sl),
+                    levels.risk_pct
+                ),
             ));
         }
         SignalDirection::Bearish => {
-            let entry_high = price + 0.30 * atr_5m;
-            let sl = price + risk;
-            let tp1 = price - tp1_dist;
-            let tp2 = price - tp2_dist;
-            let tp3 = price - tp3_dist;
             details.push((
                 "🧭 แผนเทรด".to_string(),
                 format!("🔴 เปิด SHORT ({})", side_note),
@@ -577,41 +639,47 @@ pub fn append_mtf_trade_plan(
                 "🎯 จุดเข้า (Entry)".to_string(),
                 format!(
                     "${} - ${} (โซนต้าน 5m)",
-                    format_price(price),
-                    format_price(entry_high)
+                    format_price(levels.entry_price),
+                    format_price(levels.entry_band)
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP1".to_string(),
                 format!(
                     "${} (+{:.2}%) [เป้าสั้น 5m]",
-                    format_price(tp1),
-                    (tp1_dist / price) * 100.0
+                    format_price(levels.tp1),
+                    levels.tp1_pct
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP2".to_string(),
                 format!(
                     "${} (+{:.2}%) [เป้ากลาง 15m]",
-                    format_price(tp2),
-                    (tp2_dist / price) * 100.0
+                    format_price(levels.tp2),
+                    levels.tp2_pct
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP3".to_string(),
                 format!(
                     "${} (+{:.2}%) [เป้ารันเทรนด์ 1h]",
-                    format_price(tp3),
-                    (tp3_dist / price) * 100.0
+                    format_price(levels.tp3),
+                    levels.tp3_pct
                 ),
             ));
             details.push((
                 "🛡️ ตัดขาดทุน (SL)".to_string(),
-                format!("${} (-{:.2}%) [เหนือต้าน 15m]", format_price(sl), risk_pct),
+                format!(
+                    "${} (-{:.2}%) [เหนือต้าน 15m]",
+                    format_price(levels.sl),
+                    levels.risk_pct
+                ),
             ));
         }
         SignalDirection::Neutral => {}
     }
+
+    Some(levels)
 }
 
 /// Appends Entry Zone, TP1 (1.5R), TP2 (2.5R), and Stop Loss (SL) details based on ATR and Swing High/Low.

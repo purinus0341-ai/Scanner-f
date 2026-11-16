@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::config::ScannerConfig;
-use crate::models::ScanSignal;
+use crate::models::{ScanSignal, SignalCategory};
 
 #[derive(Clone)]
 pub struct AlertNotifier {
@@ -46,6 +46,18 @@ impl AlertNotifier {
             .filter(|(_, &ts)| now - ts < cooldown_secs)
             .map(|(k, &v)| (k.clone(), v))
             .collect()
+    }
+
+    /// Checks whether `(symbol, category)` is currently inside the cooldown window without mutating state.
+    pub async fn is_in_cooldown(&self, symbol: &str, category: SignalCategory) -> bool {
+        let cooldown_secs = self.config.alert_cooldown_secs as i64;
+        let key = format!("{}:{}", symbol, category.as_key());
+        let now = Utc::now().timestamp();
+        let map = self.cooldowns.lock().await;
+        if let Some(&last_sent) = map.get(&key) {
+            return now - last_sent < cooldown_secs;
+        }
+        false
     }
 
     /// Checks if the `(symbol, category)` pair is outside the cooldown window and sends the alert.
@@ -100,6 +112,63 @@ impl AlertNotifier {
         }
 
         Ok(())
+    }
+
+    /// Sends a formatted paper trading event notification to Telegram / Discord if enabled.
+    pub async fn send_paper_trade_alert(
+        &self,
+        title: &str,
+        symbol: &str,
+        lines_th: &[String],
+        discord_color: u32,
+    ) {
+        if !self.config.paper_notify_webhooks {
+            return;
+        }
+
+        if let (Some(token), Some(chat_id)) = (
+            &self.config.telegram_bot_token,
+            &self.config.telegram_chat_id,
+        ) {
+            let mut msg_lines = Vec::with_capacity(lines_th.len() + 2);
+            msg_lines.push(format!("<b>{}</b>", html_escape(title)));
+            for line in lines_th {
+                msg_lines.push(html_escape(line));
+            }
+            msg_lines.push(format!(
+                "\n🔗 <a href=\"https://www.binance.com/en/futures/{}\">ดูกราฟ {}</a>",
+                html_escape(symbol),
+                html_escape(symbol)
+            ));
+
+            let payload = json!({
+                "chat_id": chat_id,
+                "text": msg_lines.join("\n"),
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true
+            });
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+            if let Err(err) = self.http_client.post(&url).json(&payload).send().await {
+                error!("Failed to send Telegram paper alert: {:#}", err);
+            }
+        }
+
+        if let Some(webhook_url) = &self.config.discord_webhook_url {
+            let payload = json!({
+                "username": "Scanner-f Paper Trader",
+                "embeds": [{
+                    "title": title,
+                    "url": format!("https://www.binance.com/en/futures/{}", symbol),
+                    "description": lines_th.join("\n"),
+                    "color": discord_color,
+                    "footer": { "text": "Scanner-f Paper Trading Simulator" },
+                    "timestamp": Utc::now().to_rfc3339()
+                }]
+            });
+            if let Err(err) = self.http_client.post(webhook_url).json(&payload).send().await {
+                error!("Failed to send Discord paper alert: {:#}", err);
+            }
+        }
     }
 
     fn log_to_console(&self, signal: &ScanSignal) {

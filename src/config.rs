@@ -57,6 +57,18 @@ pub struct ScannerConfig {
     /// Path to persistent state file (stores previous Open Interest & cooldowns between runs)
     pub state_file: String,
 
+    /// Paper Trading Simulator settings
+    pub paper_trading_enabled: bool,
+    pub paper_initial_balance: f64,
+    pub paper_leverage: f64,
+    pub paper_position_pct: f64,
+    pub paper_max_open_positions: usize,
+    pub paper_min_stars: u8,
+    pub paper_taker_fee_pct: f64,
+    pub paper_notify_webhooks: bool,
+    pub paper_state_file: String,
+    pub paper_trades_csv: String,
+
     /// Notification webhooks / tokens
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
@@ -107,6 +119,17 @@ impl ScannerConfig {
                 .filter(|&v| v > 0),
             state_file: env_string("SCANNER_STATE_FILE", ".scanner_state.json"),
 
+            paper_trading_enabled: env_bool("PAPER_TRADING_ENABLED", true),
+            paper_initial_balance: env_f64("PAPER_INITIAL_BALANCE", 1000.0),
+            paper_leverage: env_f64("PAPER_LEVERAGE", 10.0),
+            paper_position_pct: env_f64("PAPER_POSITION_PCT", 10.0),
+            paper_max_open_positions: env_usize("PAPER_MAX_OPEN_POSITIONS", 5),
+            paper_min_stars: (env_usize("PAPER_MIN_STARS", 2).clamp(1, 3)) as u8,
+            paper_taker_fee_pct: env_f64("PAPER_TAKER_FEE_PCT", 0.05),
+            paper_notify_webhooks: env_bool("PAPER_NOTIFY_WEBHOOKS", true),
+            paper_state_file: env_string("PAPER_STATE_FILE", "paper_state.json"),
+            paper_trades_csv: env_string("PAPER_TRADES_CSV", "paper_trades.csv"),
+
             telegram_bot_token: env_opt_string("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id: env_opt_string("TELEGRAM_CHAT_ID"),
             discord_webhook_url: env_opt_string("DISCORD_WEBHOOK_URL"),
@@ -155,5 +178,16 @@ fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|v| match v.trim().to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        })
         .unwrap_or(default)
 }

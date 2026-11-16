@@ -3,3 +3,7 @@
 *.log
 .DS_Store
 .scanner_state.json
+paper_state.json
+paper_trades.csv
+__pycache__/
+*.pyc

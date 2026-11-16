@@ -23,6 +23,7 @@ use crate::models::{
     WsKlineEvent,
 };
 use crate::notifier::{format_compact_usd, format_price, AlertNotifier};
+use crate::paper_trader::PaperTrader;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -34,18 +35,20 @@ pub struct FuturesScanner {
     config: ScannerConfig,
     client: BinanceFuturesClient,
     notifier: AlertNotifier,
+    paper_trader: PaperTrader,
     candles: Arc<RwLock<HashMap<String, Vec<Candle>>>>,
     tickers: Arc<RwLock<HashMap<String, Ticker24hr>>>,
     previous_oi: Arc<RwLock<HashMap<String, f64>>>,
 }
 
 impl FuturesScanner {
-    pub fn new(config: ScannerConfig, notifier: AlertNotifier) -> Self {
+    pub fn new(config: ScannerConfig, notifier: AlertNotifier, paper_trader: PaperTrader) -> Self {
         let client = BinanceFuturesClient::new(config.clone());
         Self {
             config,
             client,
             notifier,
+            paper_trader,
             candles: Arc::new(RwLock::new(HashMap::new())),
             tickers: Arc::new(RwLock::new(HashMap::new())),
             previous_oi: Arc::new(RwLock::new(HashMap::new())),
@@ -104,6 +107,12 @@ impl FuturesScanner {
             symbols.len(),
             self.config.max_symbols
         );
+
+        let price_snapshot: HashMap<String, f64> = ticker_map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.last_price_f64()))
+            .collect();
+        self.paper_trader.update_prices(&price_snapshot).await;
 
         {
             let mut t_guard = self.tickers.write().await;
@@ -167,6 +176,9 @@ impl FuturesScanner {
         signal_count += oi_signals;
 
         self.save_state().await;
+        if self.config.paper_trading_enabled {
+            self.paper_trader.print_portfolio_summary().await;
+        }
 
         Ok((symbols, signal_count))
     }
@@ -214,6 +226,12 @@ impl FuturesScanner {
                 if let Ok((_, new_tickers)) =
                     scanner_poller.client.fetch_qualified_usdt_perpetuals().await
                 {
+                    let price_snapshot: HashMap<String, f64> = new_tickers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.last_price_f64()))
+                        .collect();
+                    scanner_poller.paper_trader.update_prices(&price_snapshot).await;
+
                     let mut t_guard = scanner_poller.tickers.write().await;
                     for (k, v) in new_tickers {
                         t_guard.insert(k, v);
@@ -223,6 +241,9 @@ impl FuturesScanner {
                 scanner_poller.scan_funding_rates(&active_set).await;
                 scanner_poller.scan_open_interest(&tracked_symbols).await;
                 scanner_poller.save_state().await;
+                if scanner_poller.config.paper_trading_enabled {
+                    scanner_poller.paper_trader.print_portfolio_summary().await;
+                }
             }
         });
 
@@ -293,6 +314,10 @@ impl FuturesScanner {
 
             buf.clone()
         };
+
+        self.paper_trader
+            .on_price_tick(&symbol, new_candle.close)
+            .await;
 
         let signals = self
             .evaluate_symbol_candles(&symbol, &snapshot, new_candle.is_closed)
@@ -613,6 +638,18 @@ impl FuturesScanner {
             return signals;
         }
 
+        // Filter out signals still inside cooldown before issuing 15m/1h REST requests or opening paper positions
+        let mut active_signals = Vec::with_capacity(signals.len());
+        for sig in signals {
+            if !self.notifier.is_in_cooldown(&sig.symbol, sig.category).await {
+                active_signals.push(sig);
+            }
+        }
+        if active_signals.is_empty() {
+            return active_signals;
+        }
+        let mut signals = active_signals;
+
         // Fetch 15m and 1h candles concurrently for Multi-Timeframe Confluence (5m + 15m + 1h)
         let (res_15m, res_1h) = tokio::join!(
             self.client.fetch_klines(symbol, "15m", 65),
@@ -662,7 +699,7 @@ impl FuturesScanner {
                     );
                     if stars >= 2 {
                         sig.timeframe = format!("{}+15m+1h", self.config.kline_interval);
-                        append_mtf_trade_plan(
+                        if let Some(levels) = append_mtf_trade_plan(
                             &mut sig.details,
                             sig.direction,
                             sig.price,
@@ -673,7 +710,18 @@ impl FuturesScanner {
                             &grade_str,
                             aligned_1h,
                             &reasons,
-                        );
+                        ) {
+                            self.paper_trader
+                                .try_open_position(
+                                    &sig.symbol,
+                                    sig.direction,
+                                    sig.category,
+                                    &sig.timeframe,
+                                    stars,
+                                    &levels,
+                                )
+                                .await;
+                        }
                         mtf_filtered.push(sig);
                     }
                 }

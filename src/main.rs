@@ -3,6 +3,7 @@ pub mod config;
 pub mod indicators;
 pub mod models;
 pub mod notifier;
+pub mod paper_trader;
 pub mod scanner;
 
 use std::env;
@@ -16,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::ScannerConfig;
 use crate::models::{ScanSignal, SignalCategory, SignalDirection};
 use crate::notifier::{format_compact_usd, AlertNotifier};
+use crate::paper_trader::PaperTrader;
 use crate::scanner::FuturesScanner;
 
 #[tokio::main]
@@ -29,11 +31,28 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let run_once = args.iter().any(|a| a == "--once");
     let test_alert = args.iter().any(|a| a == "--test-alert");
+    let paper_status = args.iter().any(|a| a == "--paper-status");
+    let paper_reset = args.iter().any(|a| a == "--paper-reset");
 
     let config = ScannerConfig::from_env();
     print_startup_banner(&config);
 
     let notifier = AlertNotifier::new(config.clone());
+    let paper_trader = PaperTrader::new(config.clone(), notifier.clone());
+
+    if paper_reset {
+        paper_trader.reset_portfolio()?;
+        info!(
+            "🔄 รีเซ็ตพอร์ตจำลองการเทรดเป็นทุนเริ่มต้น ${:.2} USDT เรียบร้อยแล้ว",
+            config.paper_initial_balance
+        );
+        return Ok(());
+    }
+
+    if paper_status {
+        paper_trader.print_portfolio_summary().await;
+        return Ok(());
+    }
 
     if test_alert {
         info!("กำลังส่งสัญญาณทดสอบ (Test Alert) ไปยังช่องทางที่ตั้งค่าไว้...");
@@ -58,7 +77,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let scanner = Arc::new(FuturesScanner::new(config, notifier));
+    let scanner = Arc::new(FuturesScanner::new(config, notifier, paper_trader));
 
     if run_once {
         let (symbols, signal_count) = scanner.initialize_and_scan_once(true).await?;
@@ -116,6 +135,15 @@ fn print_startup_banner(cfg: &ScannerConfig) {
         cfg.funding_rate_threshold_pct,
         cfg.oi_spike_threshold_pct,
         format_compact_usd(cfg.min_liquidation_usd)
+    );
+    info!(
+        "• จำลองการเทรด     : {} | ทุน ${:.0} | {:.0}x | ไม้ละ {:.0}% | Max {} ไม้ | >= {} ดาว",
+        if cfg.paper_trading_enabled { "เปิด ✅" } else { "ปิด ⚪" },
+        cfg.paper_initial_balance,
+        cfg.paper_leverage,
+        cfg.paper_position_pct,
+        cfg.paper_max_open_positions,
+        cfg.paper_min_stars
     );
     info!(
         "• ช่องทางแจ้งเตือน   : Telegram={} | Discord Webhook={} | Cooldown={}s",

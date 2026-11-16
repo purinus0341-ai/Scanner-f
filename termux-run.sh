@@ -42,19 +42,25 @@ fi
 setup_env() {
     echo ""
     echo "--------------------------------------------------------------"
-    echo "⚙️ ตั้งค่าการแจ้งเตือน (กด Enter ข้ามได้หากต้องการดูบนหน้าจอมือถืออย่างเดียว)"
+    echo "⚙️ ตั้งค่าการแจ้งเตือน & พอร์ตจำลอง (กด Enter เพื่อใช้ค่าเริ่มต้นได้เลย)"
     echo "--------------------------------------------------------------"
     read -r -p "👉 Telegram Bot Token (เว้นว่างได้): " TG_TOKEN < /dev/tty || TG_TOKEN=""
     read -r -p "👉 Telegram Chat ID (เว้นว่างได้): " TG_CHAT < /dev/tty || TG_CHAT=""
     read -r -p "👉 Discord Webhook URL (เว้นว่างได้): " DC_WEBHOOK < /dev/tty || DC_WEBHOOK=""
     read -r -p "👉 Timeframe แท่งเทียน [ค่าเริ่มต้น 5m]: " TF_INPUT < /dev/tty || TF_INPUT=""
     TF_INPUT="${TF_INPUT:-5m}"
+    read -r -p "👉 ทุนจำลองเริ่มต้น USDT [ค่าเริ่มต้น 1000]: " PAPER_BAL < /dev/tty || PAPER_BAL=""
+    PAPER_BAL="${PAPER_BAL:-1000.0}"
+    read -r -p "👉 Leverage จำลอง (เช่น 10) [ค่าเริ่มต้น 10]: " PAPER_LEV < /dev/tty || PAPER_LEV=""
+    PAPER_LEV="${PAPER_LEV:-10.0}"
 
     cp -f .env.example .env
     sed -i "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${TG_TOKEN}|" .env
     sed -i "s|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${TG_CHAT}|" .env
     sed -i "s|^DISCORD_WEBHOOK_URL=.*|DISCORD_WEBHOOK_URL=${DC_WEBHOOK}|" .env
     sed -i "s|^KLINE_INTERVAL=.*|KLINE_INTERVAL=${TF_INPUT}|" .env
+    sed -i "s|^PAPER_INITIAL_BALANCE=.*|PAPER_INITIAL_BALANCE=${PAPER_BAL}|" .env
+    sed -i "s|^PAPER_LEVERAGE=.*|PAPER_LEVERAGE=${PAPER_LEV}|" .env
 
     echo "✅ บันทึกการตั้งค่าลงไฟล์ .env เรียบร้อย!"
 }
@@ -63,16 +69,22 @@ if [ ! -f ".env" ]; then
     setup_env
 fi
 
-echo ""
-echo "=============================================================="
-echo "🚀 เลือกโหมดการทำงานบนมือถือ:"
-echo "  1) ⚡ โหมดรันทันที (Mobile Fast Mode - ไม่ต้องรอคอมไพล์ ประหยัดแบต)"
-echo "  2) 🦀 โหมด Rust เต็มรูปแบบ (WebSocket เรียลไทม์ + ดัก Liquidation สด)"
-echo "  3) 🔔 ทดสอบส่งข้อความแจ้งเตือนเข้า Telegram / Discord (--test-alert)"
-echo "  4) ⚙️ แก้ไขการตั้งค่า Telegram / Discord / Timeframe ใหม่"
-echo "=============================================================="
-read -r -p "เลือกหมายเลข [1-4, ค่าเริ่มต้น=1]: " CHOICE < /dev/tty || CHOICE="1"
-CHOICE="${CHOICE:-1}"
+CHOICE="${1:-}"
+if [ -z "$CHOICE" ]; then
+    echo ""
+    echo "=============================================================="
+    echo "🚀 เลือกโหมดการทำงานบนมือถือ:"
+    echo "  1) ⚡ โหมดรันทันที + จำลองเทรดอัตโนมัติ (Mobile Fast Mode - แนะนำ)"
+    echo "  2) 🦀 โหมด Rust เต็มรูปแบบ (WebSocket เรียลไทม์ + ดัก Liquidation สด)"
+    echo "  3) 💼 ดูพอร์ตจำลองการเทรดล่าสุด (--paper-status)"
+    echo "  4) 🔄 รีเซ็ตพอร์ตจำลองกลับเป็นทุนเริ่มต้น (--paper-reset)"
+    echo "  5) 🔔 ทดสอบส่งข้อความแจ้งเตือนเข้า Telegram / Discord (--test-alert)"
+    echo "  6) 🧪 ทดสอบระบบคำนวณ Paper Trading (--paper-self-test)"
+    echo "  7) ⚙️ แก้ไขการตั้งค่า Telegram / Discord / Timeframe / พอร์ตจำลอง"
+    echo "=============================================================="
+    read -r -p "เลือกหมายเลข [1-7, ค่าเริ่มต้น=1]: " CHOICE < /dev/tty || CHOICE="1"
+    CHOICE="${CHOICE:-1}"
+fi
 
 case "$CHOICE" in
     2|rust)
@@ -90,10 +102,19 @@ case "$CHOICE" in
         cargo build --release
         ./target/release/scanner-f
         ;;
-    3|test)
+    3|status|--paper-status)
+        python3 mobile_scanner.py --paper-status
+        ;;
+    4|reset|--paper-reset)
+        python3 mobile_scanner.py --paper-reset
+        ;;
+    5|test|--test-alert)
         python3 mobile_scanner.py --test-alert
         ;;
-    4|config)
+    6|self-test|--paper-self-test)
+        python3 mobile_scanner.py --paper-self-test
+        ;;
+    7|config)
         setup_env
         python3 mobile_scanner.py
         ;;
