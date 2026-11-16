@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::binance::{
@@ -24,6 +24,7 @@ use crate::models::{
 };
 use crate::notifier::{format_compact_usd, format_price, AlertNotifier};
 use crate::paper_trader::PaperTrader;
+use crate::telegram_bot::TelegramBotController;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -36,6 +37,7 @@ pub struct FuturesScanner {
     client: BinanceFuturesClient,
     notifier: AlertNotifier,
     paper_trader: PaperTrader,
+    scan_now_notify: Arc<Notify>,
     candles: Arc<RwLock<HashMap<String, Vec<Candle>>>>,
     tickers: Arc<RwLock<HashMap<String, Ticker24hr>>>,
     previous_oi: Arc<RwLock<HashMap<String, f64>>>,
@@ -49,10 +51,21 @@ impl FuturesScanner {
             client,
             notifier,
             paper_trader,
+            scan_now_notify: Arc::new(Notify::new()),
             candles: Arc::new(RwLock::new(HashMap::new())),
             tickers: Arc::new(RwLock::new(HashMap::new())),
             previous_oi: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn telegram_bot_controller(&self) -> Arc<TelegramBotController> {
+        Arc::new(TelegramBotController::new(
+            self.config.clone(),
+            self.client.clone(),
+            self.notifier.clone(),
+            self.paper_trader.clone(),
+            self.scan_now_notify.clone(),
+        ))
     }
 
     pub async fn load_state(&self) {
@@ -185,11 +198,18 @@ impl FuturesScanner {
 
     /// Runs the full real-time scanner loop (WebSocket Kline Streams + Liquidation Stream + Futures Metric Poller).
     pub async fn run_forever(self: Arc<Self>) -> Result<()> {
+        let telegram_bot = self.telegram_bot_controller();
+        telegram_bot.clone().spawn_background();
+
         let (symbols, initial_signals) = self.initialize_and_scan_once(true).await?;
         info!(
             "เริ่มต้นสแกนเรียลไทม์สำเร็จ! (พบสัญญาณรอบแรก {} รายการ)",
             initial_signals
         );
+
+        telegram_bot
+            .send_dashboard_message(false, Some("🚀 เริ่มทำงานสแกนตลาด + จำลองการเทรดแล้ว"))
+            .await;
 
         let (kline_tx, mut kline_rx) = mpsc::channel::<WsKlineEvent>(2048);
         let (liq_tx, mut liq_rx) = mpsc::channel::<WsForceOrderEvent>(1024);
@@ -220,7 +240,12 @@ impl FuturesScanner {
             let active_set: HashSet<String> = tracked_symbols.iter().cloned().collect();
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = scanner_poller.scan_now_notify.notified() => {
+                        info!("🔍 กำลังอัปเดตข้อมูลตลาด Funding Rate / Open Interest ตามคำสั่ง Telegram...");
+                    }
+                }
                 debug!("กำลังอัปเดตข้อมูล Funding Rate, Open Interest และ 24h Ticker...");
 
                 if let Ok((_, new_tickers)) =

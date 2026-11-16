@@ -5,20 +5,24 @@ pub mod models;
 pub mod notifier;
 pub mod paper_trader;
 pub mod scanner;
+pub mod telegram_bot;
 
 use std::env;
 use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
+use tokio::sync::Notify;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use crate::binance::BinanceFuturesClient;
 use crate::config::ScannerConfig;
 use crate::models::{ScanSignal, SignalCategory, SignalDirection};
 use crate::notifier::{format_compact_usd, AlertNotifier};
 use crate::paper_trader::PaperTrader;
 use crate::scanner::FuturesScanner;
+use crate::telegram_bot::TelegramBotController;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,12 +37,21 @@ async fn main() -> Result<()> {
     let test_alert = args.iter().any(|a| a == "--test-alert");
     let paper_status = args.iter().any(|a| a == "--paper-status");
     let paper_reset = args.iter().any(|a| a == "--paper-reset");
+    let send_telegram_flag = args.iter().any(|a| a == "--send");
 
     let config = ScannerConfig::from_env();
     print_startup_banner(&config);
 
     let notifier = AlertNotifier::new(config.clone());
     let paper_trader = PaperTrader::new(config.clone(), notifier.clone());
+    let client = BinanceFuturesClient::new(config.clone());
+    let bot_ctrl = TelegramBotController::new(
+        config.clone(),
+        client,
+        notifier.clone(),
+        paper_trader.clone(),
+        Arc::new(Notify::new()),
+    );
 
     if paper_reset {
         paper_trader.reset_portfolio()?;
@@ -51,6 +64,11 @@ async fn main() -> Result<()> {
 
     if paper_status {
         paper_trader.print_portfolio_summary().await;
+        if send_telegram_flag {
+            bot_ctrl
+                .send_dashboard_message(true, Some("💼 รายงานพอร์ตจำลองตามคำสั่ง"))
+                .await;
+        }
         return Ok(());
     }
 
@@ -74,10 +92,13 @@ async fn main() -> Result<()> {
             timestamp: Utc::now(),
         };
         notifier.send_test_notification(&sample_signal).await?;
+        bot_ctrl
+            .send_dashboard_message(false, Some("🧪 ทดสอบแสดงผลพอร์ตจำลอง + ปุ่มสั่งการบน Telegram"))
+            .await;
         return Ok(());
     }
 
-    let scanner = Arc::new(FuturesScanner::new(config, notifier, paper_trader));
+    let scanner = Arc::new(FuturesScanner::new(config.clone(), notifier, paper_trader));
 
     if run_once {
         let (symbols, signal_count) = scanner.initialize_and_scan_once(true).await?;
@@ -86,6 +107,9 @@ async fn main() -> Result<()> {
             symbols.len(),
             signal_count
         );
+        bot_ctrl
+            .send_dashboard_message(false, Some("📊 สรุปพอร์ตจำลองหลังสแกนรอบล่าสุด"))
+            .await;
         return Ok(());
     }
 

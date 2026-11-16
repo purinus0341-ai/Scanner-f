@@ -200,6 +200,33 @@ impl BinanceFuturesClient {
             .with_context(|| format!("Failed to parse openInterest JSON for {}", symbol))?;
         Ok(resp)
     }
+
+    /// Fetches lightweight latest prices for all symbols (`/fapi/v1/ticker/price`).
+    pub async fn fetch_all_prices(&self) -> Result<HashMap<String, f64>> {
+        let url = format!("{}/fapi/v1/ticker/price", self.config.rest_base_url);
+        let rows: Vec<Value> = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch /fapi/v1/ticker/price")?
+            .error_for_status()
+            .context("Error status from /fapi/v1/ticker/price")?
+            .json()
+            .await
+            .context("Failed to parse /fapi/v1/ticker/price JSON")?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in rows {
+            if let Some(sym) = row.get("symbol").and_then(|v| v.as_str()) {
+                let price = value_to_f64(&row["price"]);
+                if price > 0.0 {
+                    map.insert(sym.to_string(), price);
+                }
+            }
+        }
+        Ok(map)
+    }
 }
 
 /// Spawns a persistent, auto-reconnecting WebSocket worker for a batch of kline streams.

@@ -89,7 +89,20 @@ pub struct PaperPortfolioState {
     pub total_closed: u64,
     pub win_count: u64,
     pub loss_count: u64,
+    #[serde(default)]
+    pub paused_opening: bool,
     pub open_positions: Vec<PaperPosition>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CsvTradeRow {
+    pub timestamp: String,
+    pub trade_id: String,
+    pub event: String,
+    pub symbol: String,
+    pub side: String,
+    pub exec_price: f64,
+    pub net_pnl: f64,
 }
 
 impl PaperPortfolioState {
@@ -105,6 +118,7 @@ impl PaperPortfolioState {
             total_closed: 0,
             win_count: 0,
             loss_count: 0,
+            paused_opening: false,
             open_positions: Vec::new(),
         }
     }
@@ -193,6 +207,59 @@ impl PaperTrader {
             fs::remove_file(&self.config.paper_trades_csv)?;
         }
         Ok(fresh)
+    }
+
+    pub async fn reset_portfolio_async(&self) -> Result<PaperPortfolioState> {
+        let mut st = self.state.lock().await;
+        let fresh = PaperPortfolioState::new(self.config.paper_initial_balance);
+        *st = fresh.clone();
+        self.save_state_sync(&st)?;
+        if Path::new(&self.config.paper_trades_csv).exists() {
+            let _ = fs::remove_file(&self.config.paper_trades_csv);
+        }
+        Ok(fresh)
+    }
+
+    pub async fn get_state_snapshot(&self) -> PaperPortfolioState {
+        self.state.lock().await.clone()
+    }
+
+    pub async fn set_paused(&self, paused: bool) -> PaperPortfolioState {
+        let mut st = self.state.lock().await;
+        st.paused_opening = paused;
+        let _ = self.save_state_sync(&st);
+        st.clone()
+    }
+
+    pub fn recent_csv_events(&self, limit: usize) -> Vec<CsvTradeRow> {
+        let path = Path::new(&self.config.paper_trades_csv);
+        if !path.exists() {
+            return Vec::new();
+        }
+        let Ok(content) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for line in content.lines().skip(1) {
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() < 16 {
+                continue;
+            }
+            rows.push(CsvTradeRow {
+                timestamp: cols[0].to_string(),
+                trade_id: cols[1].to_string(),
+                event: cols[2].to_string(),
+                symbol: cols[3].to_string(),
+                side: cols[4].to_string(),
+                exec_price: cols[9].parse::<f64>().unwrap_or(0.0),
+                net_pnl: cols[15].parse::<f64>().unwrap_or(0.0),
+            });
+        }
+        if rows.len() > limit {
+            rows = rows.split_off(rows.len() - limit);
+        }
+        rows.reverse();
+        rows
     }
 
     fn save_state_sync(&self, state: &PaperPortfolioState) -> Result<()> {
@@ -285,6 +352,9 @@ impl PaperTrader {
 
         let notif = {
             let mut st = self.state.lock().await;
+            if st.paused_opening {
+                return None;
+            }
             if st.open_positions.len() >= self.config.paper_max_open_positions {
                 return None;
             }
@@ -813,6 +883,137 @@ impl PaperTrader {
         }
     }
 
+    /// Manually closes an open position by trade ID (triggered from Telegram controls).
+    pub async fn close_position_by_id(
+        &self,
+        trade_id: u64,
+        market_prices: Option<&HashMap<String, f64>>,
+    ) -> Option<(String, f64)> {
+        let (ev, result) = {
+            let mut st = self.state.lock().await;
+            let pos_idx = st.open_positions.iter().position(|p| p.id == trade_id)?;
+            let mut pos = st.open_positions.remove(pos_idx);
+
+            let exec_price = market_prices
+                .and_then(|m| m.get(&pos.symbol).copied())
+                .filter(|&p| p > 0.0)
+                .unwrap_or(pos.last_price);
+            pos.last_price = exec_price;
+
+            let fee_rate = self.config.paper_taker_fee_pct / 100.0;
+            let close_qty = pos.remaining_qty;
+            let gross = match pos.side {
+                PaperSide::Long => (exec_price - pos.entry_price) * close_qty,
+                PaperSide::Short => (pos.entry_price - exec_price) * close_qty,
+            };
+            let exit_fee = (close_qty * exec_price) * fee_rate;
+            let raw_net = gross - exit_fee;
+            let returned_cash = (pos.remaining_margin + raw_net).max(0.0);
+            let net_step = returned_cash - pos.remaining_margin;
+
+            pos.realized_pnl_trade += net_step;
+            pos.fees_paid_trade += exit_fee;
+            pos.remaining_qty = 0.0;
+            pos.remaining_margin = 0.0;
+            pos.remaining_fraction = 0.0;
+
+            st.free_balance += returned_cash;
+            st.realized_pnl += net_step;
+            st.total_fees += exit_fee;
+            st.total_closed += 1;
+            if pos.realized_pnl_trade >= 0.0 {
+                st.win_count += 1;
+            } else {
+                st.loss_count += 1;
+            }
+
+            st.update_drawdown();
+            let eq_after = st.total_equity();
+            let free_after = st.free_balance;
+            let pct_closed = if pos.initial_qty > 0.0 {
+                (close_qty / pos.initial_qty) * 100.0
+            } else {
+                100.0
+            };
+
+            self.append_csv_row(
+                pos.id,
+                "MANUAL_CLOSE",
+                &pos,
+                exec_price,
+                pct_closed,
+                gross,
+                exit_fee,
+                net_step,
+                free_after,
+                eq_after,
+                "Closed manually via Telegram",
+            );
+            let _ = self.save_state_sync(&st);
+
+            let icon = if pos.realized_pnl_trade >= 0.0 { "✅" } else { "🛑" };
+            let notif = TradeEventNotification {
+                title: format!(
+                    "{} [PAPER] ปิดมือ #{} {} — สั่งปิดจาก Telegram",
+                    icon, pos.id, pos.symbol
+                ),
+                symbol: pos.symbol.clone(),
+                lines_th: vec![
+                    format!("📌 สถานะ: {} (ปิดด้วยตนเอง)", pos.side.as_str()),
+                    format!(
+                        "🎯 Entry: ${} -> Exit: ${}",
+                        format_price(pos.entry_price),
+                        format_price(exec_price)
+                    ),
+                    format!(
+                        "💵 กำไร/ขาดทุนสุทธิไม้นี้: {:+.2} USDT (ค่าธรรมเนียมรวม ${:.2})",
+                        pos.realized_pnl_trade, pos.fees_paid_trade
+                    ),
+                    format!(
+                        "📊 สถิติพอร์ต: Equity ${:.2} | Win Rate {:.1}% ({}W/{}L)",
+                        eq_after,
+                        st.win_rate_pct(),
+                        st.win_count,
+                        st.loss_count
+                    ),
+                ],
+                discord_color: if pos.realized_pnl_trade >= 0.0 {
+                    0x00E676
+                } else {
+                    0xFF5252
+                },
+            };
+
+            (notif, (pos.symbol, pos.realized_pnl_trade))
+        };
+
+        info!("{} -> {}", ev.title, ev.lines_th.join(" | "));
+        self.notifier
+            .send_paper_trade_alert(&ev.title, &ev.symbol, &ev.lines_th, ev.discord_color)
+            .await;
+        Some(result)
+    }
+
+    /// Manually closes all open positions (triggered from Telegram Close All).
+    pub async fn close_all_positions(
+        &self,
+        market_prices: Option<&HashMap<String, f64>>,
+    ) -> (usize, f64) {
+        let ids: Vec<u64> = {
+            let st = self.state.lock().await;
+            st.open_positions.iter().map(|p| p.id).collect()
+        };
+        let mut closed_count = 0usize;
+        let mut sum_pnl = 0.0f64;
+        for id in ids {
+            if let Some((_, trade_pnl)) = self.close_position_by_id(id, market_prices).await {
+                closed_count += 1;
+                sum_pnl += trade_pnl;
+            }
+        }
+        (closed_count, sum_pnl)
+    }
+
     pub async fn print_portfolio_summary(&self) {
         let st = self.state.lock().await;
         let eq = st.total_equity();
@@ -846,7 +1047,11 @@ impl PaperTrader {
         if st.open_positions.is_empty() {
             info!("• ออเดอร์ที่ถืออยู่: ไม่มี (รอสัญญาณ ⭐⭐/⭐⭐⭐)");
         } else {
-            info!("• ออเดอร์ที่ถืออยู่ ({}/{}):", st.open_positions.len(), self.config.paper_max_open_positions);
+            info!(
+                "• ออเดอร์ที่ถืออยู่ ({}/{}):",
+                st.open_positions.len(),
+                self.config.paper_max_open_positions
+            );
             for p in &st.open_positions {
                 let stage = if p.tp2_hit {
                     "ผ่าน TP1+TP2 (ถือ 30%)"
@@ -1006,6 +1211,70 @@ mod tests {
             assert_eq!(st.win_count, 1);
             assert!(st.free_balance > 1005.0);
         }
+
+        let _ = fs::remove_file(&cfg.paper_state_file);
+        let _ = fs::remove_file(&cfg.paper_trades_csv);
+    }
+
+    #[tokio::test]
+    async fn test_paper_trading_pause_and_manual_close() {
+        let cfg = test_config("manual");
+        let notifier = AlertNotifier::new(cfg.clone());
+        let pt = PaperTrader::new(cfg.clone(), notifier);
+
+        let levels = MtfTradeLevels {
+            entry_price: 100.0,
+            entry_band: 99.5,
+            sl: 98.0,
+            tp1: 102.0,
+            tp2: 104.0,
+            tp3: 106.0,
+            risk_pct: 2.0,
+            tp1_pct: 2.0,
+            tp2_pct: 4.0,
+            tp3_pct: 6.0,
+        };
+
+        // Pause should block new openings
+        let st_paused = pt.set_paused(true).await;
+        assert!(st_paused.paused_opening);
+        assert!(pt
+            .try_open_position(
+                "SOLUSDT",
+                SignalDirection::Bullish,
+                SignalCategory::PricePump,
+                "5m+15m+1h",
+                3,
+                &levels
+            )
+            .await
+            .is_none());
+
+        // Resume allows opening again
+        pt.set_paused(false).await;
+        let tid = pt
+            .try_open_position(
+                "SOLUSDT",
+                SignalDirection::Bullish,
+                SignalCategory::PricePump,
+                "5m+15m+1h",
+                3,
+                &levels,
+            )
+            .await
+            .unwrap();
+
+        let mut prices = HashMap::new();
+        prices.insert("SOLUSDT".to_string(), 101.0);
+        let closed = pt.close_position_by_id(tid, Some(&prices)).await.unwrap();
+        assert_eq!(closed.0, "SOLUSDT");
+        assert!(closed.1 > 8.0);
+        assert_eq!(pt.recent_csv_events(5).len(), 2);
+
+        pt.reset_portfolio_async().await.unwrap();
+        let snap = pt.get_state_snapshot().await;
+        assert_eq!(snap.total_closed, 0);
+        assert!((snap.free_balance - 1000.0).abs() < 1e-6);
 
         let _ = fs::remove_file(&cfg.paper_state_file);
         let _ = fs::remove_file(&cfg.paper_trades_csv);

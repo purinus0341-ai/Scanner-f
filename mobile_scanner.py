@@ -9,11 +9,13 @@
 """
 
 import concurrent.futures
+import copy
 import html
 import json
 import math
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -89,6 +91,8 @@ PAPER_MAX_OPEN_POSITIONS = int(os.environ.get("PAPER_MAX_OPEN_POSITIONS", "5"))
 PAPER_MIN_STARS = max(1, min(3, int(os.environ.get("PAPER_MIN_STARS", "2"))))
 PAPER_TAKER_FEE_PCT = float(os.environ.get("PAPER_TAKER_FEE_PCT", "0.05"))
 PAPER_NOTIFY_WEBHOOKS = env_bool("PAPER_NOTIFY_WEBHOOKS", True)
+PAPER_TELEGRAM_BOT_ENABLED = env_bool("PAPER_TELEGRAM_BOT_ENABLED", True)
+PAPER_TELEGRAM_SUMMARY_MINS = int(os.environ.get("PAPER_TELEGRAM_SUMMARY_MINS", "0"))
 PAPER_STATE_FILE = os.environ.get("PAPER_STATE_FILE", "paper_state.json")
 PAPER_TRADES_CSV = os.environ.get("PAPER_TRADES_CSV", "paper_trades.csv")
 
@@ -493,15 +497,25 @@ def send_paper_webhook(title, symbol, lines_th, discord_color):
         for line in lines_th:
             msg_lines.append(html.escape(str(line)))
         msg_lines.append(f'\n🔗 <a href="{futures_url}">ดูกราฟ {html.escape(symbol)}</a>')
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": "\n".join(msg_lines),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if PAPER_TELEGRAM_BOT_ENABLED:
+            payload["reply_markup"] = {
+                "inline_keyboard": [
+                    [
+                        {"text": "💼 ดูพอร์ต + ปุ่มสั่งการ", "callback_data": "paper:panel"},
+                        {"text": "📜 ประวัติ 10 รายการ", "callback_data": "paper:history_new"},
+                    ]
+                ]
+            }
         try:
             http_post_json(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                {
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": "\n".join(msg_lines),
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
+                payload,
             )
         except Exception as e:
             print(f"   ⚠️ ส่ง Telegram (Paper) ไม่สำเร็จ: {e}")
@@ -528,10 +542,118 @@ def send_paper_webhook(title, symbol, lines_th, discord_color):
             print(f"   ⚠️ ส่ง Discord (Paper) ไม่สำเร็จ: {e}")
 
 
+def fetch_all_prices():
+    rows = http_get_json(f"{FAPI_URL}/fapi/v1/ticker/price", timeout=10)
+    pmap = {}
+    for r in rows:
+        sym = r.get("symbol")
+        try:
+            p = float(r.get("price", 0.0))
+        except Exception:
+            p = 0.0
+        if sym and p > 0:
+            pmap[sym] = p
+    return pmap
+
+
+def tg_api_post(method, payload, timeout=12):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN not configured")
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "scanner-f-mtf-mobile/2.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code}: {err_body or e.reason}") from e
+
+
+def tg_send_html(html_text, inline_keyboard=None):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return 0
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": html_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if inline_keyboard is not None:
+        payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+    res = tg_api_post("sendMessage", payload)
+    return res.get("result", {}).get("message_id", 0)
+
+
+def tg_edit_html(chat_id, message_id, html_text, inline_keyboard=None):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    payload = {
+        "chat_id": str(chat_id),
+        "message_id": int(message_id),
+        "text": html_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if inline_keyboard is not None:
+        payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+    try:
+        tg_api_post("editMessageText", payload)
+    except Exception as e:
+        if "message is not modified" in str(e):
+            return
+        raise
+
+
+def tg_answer_callback(callback_query_id, text=None, show_alert=False):
+    if not TELEGRAM_BOT_TOKEN or not callback_query_id:
+        return
+    payload = {"callback_query_id": callback_query_id, "show_alert": bool(show_alert)}
+    if text:
+        payload["text"] = str(text)
+    try:
+        tg_api_post("answerCallbackQuery", payload)
+    except Exception:
+        pass
+
+
+def tg_set_commands():
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    payload = {
+        "commands": [
+            {"command": "portfolio", "description": "💼 ดูพอร์ตจำลอง + ปุ่มสั่งการ"},
+            {"command": "history", "description": "📜 ดูประวัติเทรด 10 รายการล่าสุด"},
+            {"command": "scan", "description": "🔍 สแกนตลาด MTF ทันที 1 รอบ"},
+            {"command": "pause", "description": "⏸️ พักการเปิดออเดอร์ใหม่ชั่วคราว"},
+            {"command": "resume", "description": "▶️ เปิดรับออเดอร์จำลองใหม่อีกครั้ง"},
+            {"command": "closeall", "description": "❌ ปิดออเดอร์จำลองทั้งหมดทันที"},
+            {"command": "reset", "description": "🔄 รีเซ็ตพอร์ตจำลองกลับเป็นทุนตั้งต้น"},
+            {"command": "help", "description": "❓ ดูคำสั่งทั้งหมดของบอท"},
+        ]
+    }
+    try:
+        tg_api_post("setMyCommands", payload)
+    except Exception:
+        pass
+
+
 class PaperTrader:
     def __init__(self, state_file=None, csv_file=None):
         self.state_file = state_file or PAPER_STATE_FILE
         self.csv_file = csv_file or PAPER_TRADES_CSV
+        self._lock = threading.RLock()
         self.state = self._load_or_init()
 
     def _new_state(self):
@@ -546,6 +668,7 @@ class PaperTrader:
             "total_closed": 0,
             "win_count": 0,
             "loss_count": 0,
+            "paused_opening": False,
             "open_positions": [],
         }
 
@@ -559,27 +682,78 @@ class PaperTrader:
                         base.update(data)
                         if not isinstance(base.get("open_positions"), list):
                             base["open_positions"] = []
+                        base.setdefault("paused_opening", False)
                         return base
             except Exception:
                 pass
         return base
 
     def save_state(self):
-        try:
-            with open(self.state_file, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"⚠️ บันทึกพอร์ตจำลองไม่สำเร็จ: {e}")
+        with self._lock:
+            try:
+                with open(self.state_file, "w", encoding="utf-8") as f:
+                    json.dump(self.state, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"⚠️ บันทึกพอร์ตจำลองไม่สำเร็จ: {e}")
+
+    def get_state_snapshot(self):
+        with self._lock:
+            return copy.deepcopy(self.state)
+
+    def set_paused(self, paused):
+        with self._lock:
+            self.state["paused_opening"] = bool(paused)
+            self.save_state()
+            return copy.deepcopy(self.state)
 
     def reset_portfolio(self):
-        self.state = self._new_state()
-        self.save_state()
-        if os.path.exists(self.csv_file):
+        with self._lock:
+            self.state = self._new_state()
+            self.save_state()
+            if os.path.exists(self.csv_file):
+                try:
+                    os.remove(self.csv_file)
+                except Exception:
+                    pass
+            return copy.deepcopy(self.state)
+
+    def recent_csv_events(self, limit=10):
+        with self._lock:
+            if not os.path.exists(self.csv_file):
+                return []
             try:
-                os.remove(self.csv_file)
+                with open(self.csv_file, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
             except Exception:
-                pass
-        return self.state
+                return []
+        rows = []
+        for line in lines[1:]:
+            cols = line.split(",")
+            if len(cols) < 16:
+                continue
+            try:
+                exec_price = float(cols[9])
+            except Exception:
+                exec_price = 0.0
+            try:
+                net_pnl = float(cols[15])
+            except Exception:
+                net_pnl = 0.0
+            rows.append(
+                {
+                    "timestamp": cols[0],
+                    "trade_id": cols[1],
+                    "event": cols[2],
+                    "symbol": cols[3],
+                    "side": cols[4],
+                    "exec_price": exec_price,
+                    "net_pnl": net_pnl,
+                }
+            )
+        if len(rows) > limit:
+            rows = rows[-limit:]
+        rows.reverse()
+        return rows
 
     @staticmethod
     def pos_unrealized_pnl(pos):
@@ -593,20 +767,40 @@ class PaperTrader:
             return 0.0
         return (PaperTrader.pos_unrealized_pnl(pos) / pos["remaining_margin"]) * 100.0
 
-    def locked_margin(self):
-        return sum(p["remaining_margin"] for p in self.state["open_positions"])
+    @staticmethod
+    def state_locked_margin(st):
+        return sum(p["remaining_margin"] for p in st.get("open_positions", []))
 
-    def unrealized_pnl(self):
-        return sum(self.pos_unrealized_pnl(p) for p in self.state["open_positions"])
+    @staticmethod
+    def state_unrealized_pnl(st):
+        return sum(PaperTrader.pos_unrealized_pnl(p) for p in st.get("open_positions", []))
 
-    def total_equity(self):
-        return self.state["free_balance"] + self.locked_margin() + self.unrealized_pnl()
+    @staticmethod
+    def state_total_equity(st):
+        return st["free_balance"] + PaperTrader.state_locked_margin(st) + PaperTrader.state_unrealized_pnl(st)
 
-    def win_rate_pct(self):
-        total = self.state["total_closed"]
+    @staticmethod
+    def state_win_rate_pct(st):
+        total = st.get("total_closed", 0)
         if total == 0:
             return 0.0
-        return (self.state["win_count"] / total) * 100.0
+        return (st.get("win_count", 0) / total) * 100.0
+
+    def locked_margin(self):
+        with self._lock:
+            return self.state_locked_margin(self.state)
+
+    def unrealized_pnl(self):
+        with self._lock:
+            return self.state_unrealized_pnl(self.state)
+
+    def total_equity(self):
+        with self._lock:
+            return self.state_total_equity(self.state)
+
+    def win_rate_pct(self):
+        with self._lock:
+            return self.state_win_rate_pct(self.state)
 
     def update_drawdown(self):
         eq = self.total_equity()
@@ -641,320 +835,399 @@ class PaperTrader:
             return None
         if direction not in ("BULL", "BEAR"):
             return None
-        if len(self.state["open_positions"]) >= PAPER_MAX_OPEN_POSITIONS:
-            return None
-        if any(p["symbol"] == symbol for p in self.state["open_positions"]):
-            return None
-
         entry_price = plan["entry_price"]
         if entry_price <= 0:
             return None
 
-        side = "Long" if direction == "BULL" else "Short"
-        equity = self.total_equity()
-        desired_margin = equity * (PAPER_POSITION_PCT / 100.0)
-        fee_rate = PAPER_TAKER_FEE_PCT / 100.0
-        max_affordable_margin = self.state["free_balance"] / (1.0 + PAPER_LEVERAGE * fee_rate)
-        margin = min(desired_margin, max_affordable_margin)
-        if margin < 5.0:
-            return None
+        pending_notif = None
+        with self._lock:
+            if self.state.get("paused_opening"):
+                return None
+            if len(self.state["open_positions"]) >= PAPER_MAX_OPEN_POSITIONS:
+                return None
+            if any(p["symbol"] == symbol for p in self.state["open_positions"]):
+                return None
 
-        notional = margin * PAPER_LEVERAGE
-        qty = notional / entry_price
-        entry_fee = notional * fee_rate
+            side = "Long" if direction == "BULL" else "Short"
+            equity = self.total_equity()
+            desired_margin = equity * (PAPER_POSITION_PCT / 100.0)
+            fee_rate = PAPER_TAKER_FEE_PCT / 100.0
+            max_affordable_margin = self.state["free_balance"] / (1.0 + PAPER_LEVERAGE * fee_rate)
+            margin = min(desired_margin, max_affordable_margin)
+            if margin < 5.0:
+                return None
 
-        self.state["free_balance"] -= (margin + entry_fee)
-        self.state["realized_pnl"] -= entry_fee
-        self.state["total_fees"] += entry_fee
+            notional = margin * PAPER_LEVERAGE
+            qty = notional / entry_price
+            entry_fee = notional * fee_rate
 
-        trade_id = self.state["next_trade_id"]
-        self.state["next_trade_id"] += 1
+            self.state["free_balance"] -= (margin + entry_fee)
+            self.state["realized_pnl"] -= entry_fee
+            self.state["total_fees"] += entry_fee
 
-        pos = {
-            "id": trade_id,
-            "symbol": symbol,
-            "side": side,
-            "stars": stars,
-            "signal_category": category_key,
-            "timeframe": timeframe,
-            "entry_price": entry_price,
-            "initial_sl": plan["sl"],
-            "current_sl": plan["sl"],
-            "tp1": plan["tp1"],
-            "tp2": plan["tp2"],
-            "tp3": plan["tp3"],
-            "leverage": PAPER_LEVERAGE,
-            "initial_margin": margin,
-            "remaining_margin": margin,
-            "initial_qty": qty,
-            "remaining_qty": qty,
-            "remaining_fraction": 1.0,
-            "tp1_hit": False,
-            "tp2_hit": False,
-            "realized_pnl_trade": -entry_fee,
-            "fees_paid_trade": entry_fee,
-            "last_price": entry_price,
-            "opened_at": datetime.now(timezone.utc).isoformat(),
-        }
+            trade_id = self.state["next_trade_id"]
+            self.state["next_trade_id"] += 1
 
-        self.state["open_positions"].append(pos)
-        self.update_drawdown()
-        eq_after = self.total_equity()
-        free_after = self.state["free_balance"]
+            pos = {
+                "id": trade_id,
+                "symbol": symbol,
+                "side": side,
+                "stars": stars,
+                "signal_category": category_key,
+                "timeframe": timeframe,
+                "entry_price": entry_price,
+                "initial_sl": plan["sl"],
+                "current_sl": plan["sl"],
+                "tp1": plan["tp1"],
+                "tp2": plan["tp2"],
+                "tp3": plan["tp3"],
+                "leverage": PAPER_LEVERAGE,
+                "initial_margin": margin,
+                "remaining_margin": margin,
+                "initial_qty": qty,
+                "remaining_qty": qty,
+                "remaining_fraction": 1.0,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "realized_pnl_trade": -entry_fee,
+                "fees_paid_trade": entry_fee,
+                "last_price": entry_price,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-        self.append_csv(
-            trade_id,
-            "OPEN",
-            pos,
-            entry_price,
-            0.0,
-            0.0,
-            entry_fee,
-            -entry_fee,
-            free_after,
-            eq_after,
-            f"{category_key} ({stars}*)",
-        )
-        self.save_state()
+            self.state["open_positions"].append(pos)
+            self.update_drawdown()
+            eq_after = self.total_equity()
+            free_after = self.state["free_balance"]
 
-        side_emoji = "🟢 LONG" if side == "Long" else "🔴 SHORT"
-        title = f"🧪 [PAPER] เปิดไม้ #{trade_id} {side_emoji} {symbol}"
-        lines_th = [
-            f"⭐ สัญญาณ: {category_key} ({stars} ดาว | TF: {timeframe})",
-            f"💰 Margin: ${margin:.2f} ({PAPER_LEVERAGE:.0f}x | มูลค่าสัญญา ${notional:.2f})",
-            f"🎯 ราคาเข้า (Entry): ${fmt_price(entry_price)}",
-            f"📊 เป้าปิด 3 ส่วน: TP1 ${fmt_price(plan['tp1'])} (40%) | TP2 ${fmt_price(plan['tp2'])} (30%) | TP3 ${fmt_price(plan['tp3'])} (30%)",
-            f"🛡️ Stop Loss: ${fmt_price(plan['sl'])} (-{plan['risk_pct']:.2f}%) | ค่าธรรมเนียม: ${entry_fee:.2f}",
-            f"💼 พอร์ตปัจจุบัน: Equity ${eq_after:.2f} | ถืออยู่ {len(self.state['open_positions'])}/{PAPER_MAX_OPEN_POSITIONS} ไม้",
-        ]
-        print(f"\n   {title}")
-        for ln in lines_th:
+            self.append_csv(
+                trade_id,
+                "OPEN",
+                pos,
+                entry_price,
+                0.0,
+                0.0,
+                entry_fee,
+                -entry_fee,
+                free_after,
+                eq_after,
+                f"{category_key} ({stars}*)",
+            )
+            self.save_state()
+
+            side_emoji = "🟢 LONG" if side == "Long" else "🔴 SHORT"
+            title = f"🧪 [PAPER] เปิดไม้ #{trade_id} {side_emoji} {symbol}"
+            lines_th = [
+                f"⭐ สัญญาณ: {category_key} ({stars} ดาว | TF: {timeframe})",
+                f"💰 Margin: ${margin:.2f} ({PAPER_LEVERAGE:.0f}x | มูลค่าสัญญา ${notional:.2f})",
+                f"🎯 ราคาเข้า (Entry): ${fmt_price(entry_price)}",
+                f"📊 เป้าปิด 3 ส่วน: TP1 ${fmt_price(plan['tp1'])} (40%) | TP2 ${fmt_price(plan['tp2'])} (30%) | TP3 ${fmt_price(plan['tp3'])} (30%)",
+                f"🛡️ Stop Loss: ${fmt_price(plan['sl'])} (-{plan['risk_pct']:.2f}%) | ค่าธรรมเนียม: ${entry_fee:.2f}",
+                f"💼 พอร์ตปัจจุบัน: Equity ${eq_after:.2f} | ถืออยู่ {len(self.state['open_positions'])}/{PAPER_MAX_OPEN_POSITIONS} ไม้",
+            ]
+            pending_notif = (title, symbol, lines_th, 0x00E676 if side == "Long" else 0xFF5252)
+
+        print(f"\n   {pending_notif[0]}")
+        for ln in pending_notif[2]:
             print(f"      {ln}")
-
         if notify:
-            send_paper_webhook(title, symbol, lines_th, 0x00E676 if side == "Long" else 0xFF5252)
+            send_paper_webhook(*pending_notif)
 
         return trade_id
 
     def update_prices(self, price_map, notify=True):
-        if not PAPER_TRADING_ENABLED or not price_map or not self.state["open_positions"]:
+        if not PAPER_TRADING_ENABLED or not price_map:
             return
 
-        fee_rate = PAPER_TAKER_FEE_PCT / 100.0
-        idx = 0
-        while idx < len(self.state["open_positions"]):
-            pos = self.state["open_positions"][idx]
-            sym = pos["symbol"]
-            price = price_map.get(sym, 0.0)
-            if price <= 0:
+        notifications = []
+        with self._lock:
+            if not self.state["open_positions"]:
+                return
+
+            fee_rate = PAPER_TAKER_FEE_PCT / 100.0
+            idx = 0
+            while idx < len(self.state["open_positions"]):
+                pos = self.state["open_positions"][idx]
+                sym = pos["symbol"]
+                price = price_map.get(sym, 0.0)
+                if price <= 0:
+                    idx += 1
+                    continue
+
+                pos["last_price"] = price
+                is_long = pos["side"] == "Long"
+
+                # 1. เช็ค Stop Loss
+                sl_hit = (price <= pos["current_sl"]) if is_long else (price >= pos["current_sl"])
+                if sl_hit:
+                    close_qty = pos["remaining_qty"]
+                    exec_price = price
+                    gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
+                    exit_fee = (close_qty * exec_price) * fee_rate
+                    raw_net = gross - exit_fee
+                    returned_cash = max(0.0, pos["remaining_margin"] + raw_net)
+                    net_step = returned_cash - pos["remaining_margin"]
+
+                    pos["realized_pnl_trade"] += net_step
+                    pos["fees_paid_trade"] += exit_fee
+                    pos["remaining_qty"] = 0.0
+                    pos["remaining_margin"] = 0.0
+                    pos["remaining_fraction"] = 0.0
+
+                    self.state["free_balance"] += returned_cash
+                    self.state["realized_pnl"] += net_step
+                    self.state["total_fees"] += exit_fee
+                    self.state["total_closed"] += 1
+                    if pos["realized_pnl_trade"] >= 0:
+                        self.state["win_count"] += 1
+                    else:
+                        self.state["loss_count"] += 1
+
+                    self.state["open_positions"].pop(idx)
+                    self.update_drawdown()
+                    eq_after = self.total_equity()
+                    free_after = self.state["free_balance"]
+
+                    if pos["tp2_hit"]:
+                        reason = "TRAILING_SL_TP1"
+                        label = "Trailing SL @ TP1 (ล็อกกำไรสำเร็จ)"
+                    elif pos["tp1_hit"]:
+                        reason = "BREAKEVEN_SL"
+                        label = "Breakeven SL (กันทุนหลังชน TP1)"
+                    else:
+                        reason = "STOP_LOSS"
+                        label = "Stop Loss (ตัดขาดทุนตามแผน)"
+
+                    pct_closed = (close_qty / pos["initial_qty"]) * 100.0 if pos["initial_qty"] > 0 else 100.0
+                    self.append_csv(pos["id"], reason, pos, exec_price, pct_closed, gross, exit_fee, net_step, free_after, eq_after, reason)
+
+                    icon = "✅" if pos["realized_pnl_trade"] >= 0 else "🛑"
+                    side_str = "LONG" if is_long else "SHORT"
+                    title = f"{icon} [PAPER] ปิดไม้ #{pos['id']} {sym} — {label}"
+                    lines_th = [
+                        f"📌 สถานะ: {side_str} ({label})",
+                        f"🎯 Entry: ${fmt_price(pos['entry_price'])} -> Exit: ${fmt_price(exec_price)}",
+                        f"💵 กำไร/ขาดทุนสุทธิไม้นี้: {pos['realized_pnl_trade']:+.2f} USDT (ค่าธรรมเนียมรวม ${pos['fees_paid_trade']:.2f})",
+                        f"📊 สถิติพอร์ต: Equity ${eq_after:.2f} | Win Rate {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L) | Max DD {self.state['max_drawdown_pct']:.2f}%",
+                    ]
+                    notifications.append((title, sym, lines_th, 0x00E676 if pos["realized_pnl_trade"] >= 0 else 0xFF5252))
+                    continue
+
+                # 2. เช็ค TP1 (ปิด 40% + เลื่อน SL กันทุน)
+                tp1_hit_now = (not pos["tp1_hit"]) and ((price >= pos["tp1"]) if is_long else (price <= pos["tp1"]))
+                if tp1_hit_now:
+                    frac = 0.40
+                    close_qty = pos["initial_qty"] * frac
+                    margin_released = pos["initial_margin"] * frac
+                    exec_price = pos["tp1"]
+                    gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
+                    exit_fee = (close_qty * exec_price) * fee_rate
+                    net_step = gross - exit_fee
+
+                    pos["tp1_hit"] = True
+                    pos["remaining_qty"] = max(0.0, pos["remaining_qty"] - close_qty)
+                    pos["remaining_margin"] = max(0.0, pos["remaining_margin"] - margin_released)
+                    pos["remaining_fraction"] = max(0.0, pos["remaining_fraction"] - frac)
+                    pos["realized_pnl_trade"] += net_step
+                    pos["fees_paid_trade"] += exit_fee
+
+                    be_buffer = fee_rate * 2.2
+                    pos["current_sl"] = pos["entry_price"] * (1.0 + be_buffer) if is_long else pos["entry_price"] * (1.0 - be_buffer)
+
+                    self.state["free_balance"] += (margin_released + net_step)
+                    self.state["realized_pnl"] += net_step
+                    self.state["total_fees"] += exit_fee
+                    self.update_drawdown()
+                    eq_after = self.total_equity()
+                    free_after = self.state["free_balance"]
+
+                    self.append_csv(pos["id"], "TP1_PARTIAL", pos, exec_price, 40.0, gross, exit_fee, net_step, free_after, eq_after, "Closed 40% & Moved SL to Breakeven")
+                    title = f"💰 [PAPER] TP1 แตก! #{pos['id']} {sym} (+ปิด 40%)"
+                    lines_th = [
+                        f"🎯 ชนเป้า TP1 ที่ ${fmt_price(exec_price)} (เก็บกำไร 40% = {net_step:+.2f} USDT)",
+                        f"🛡️ เลื่อน SL กันทุน (Breakeven) อัตโนมัติ -> ${fmt_price(pos['current_sl'])}",
+                        f"💼 เหลือถือรันต่อ 60% ลุ้น TP2 (${fmt_price(pos['tp2'])}) / TP3 (${fmt_price(pos['tp3'])}) | Equity ${eq_after:.2f}",
+                    ]
+                    notifications.append((title, sym, lines_th, 0x00E676))
+
+                # 3. เช็ค TP2 (ปิด 30% + เลื่อน SL ล็อกกำไรที่ TP1)
+                tp2_hit_now = pos["tp1_hit"] and (not pos["tp2_hit"]) and ((price >= pos["tp2"]) if is_long else (price <= pos["tp2"]))
+                if tp2_hit_now:
+                    frac = 0.30
+                    close_qty = pos["initial_qty"] * frac
+                    margin_released = pos["initial_margin"] * frac
+                    exec_price = pos["tp2"]
+                    gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
+                    exit_fee = (close_qty * exec_price) * fee_rate
+                    net_step = gross - exit_fee
+
+                    pos["tp2_hit"] = True
+                    pos["remaining_qty"] = max(0.0, pos["remaining_qty"] - close_qty)
+                    pos["remaining_margin"] = max(0.0, pos["remaining_margin"] - margin_released)
+                    pos["remaining_fraction"] = max(0.0, pos["remaining_fraction"] - frac)
+                    pos["realized_pnl_trade"] += net_step
+                    pos["fees_paid_trade"] += exit_fee
+                    pos["current_sl"] = pos["tp1"]
+
+                    self.state["free_balance"] += (margin_released + net_step)
+                    self.state["realized_pnl"] += net_step
+                    self.state["total_fees"] += exit_fee
+                    self.update_drawdown()
+                    eq_after = self.total_equity()
+                    free_after = self.state["free_balance"]
+
+                    self.append_csv(pos["id"], "TP2_PARTIAL", pos, exec_price, 30.0, gross, exit_fee, net_step, free_after, eq_after, "Closed 30% & Trailed SL to TP1")
+                    title = f"🚀 [PAPER] TP2 แตก! #{pos['id']} {sym} (+ปิดอีก 30%)"
+                    lines_th = [
+                        f"🎯 ชนเป้า TP2 ที่ ${fmt_price(exec_price)} (เก็บกำไรเพิ่ม 30% = {net_step:+.2f} USDT)",
+                        f"🔒 เลื่อน Trailing SL ล็อกกำไรที่ TP1 -> ${fmt_price(pos['current_sl'])}",
+                        f"💼 เหลือถือรันต่อ 30% ลุ้น TP3 (${fmt_price(pos['tp3'])}) | Equity ${eq_after:.2f}",
+                    ]
+                    notifications.append((title, sym, lines_th, 0x00E676))
+
+                # 4. เช็ค TP3 (ปิด 30% สุดท้าย)
+                tp3_hit_now = pos["tp2_hit"] and ((price >= pos["tp3"]) if is_long else (price <= pos["tp3"]))
+                if tp3_hit_now:
+                    close_qty = pos["remaining_qty"]
+                    margin_released = pos["remaining_margin"]
+                    exec_price = pos["tp3"]
+                    gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
+                    exit_fee = (close_qty * exec_price) * fee_rate
+                    net_step = gross - exit_fee
+
+                    pos["realized_pnl_trade"] += net_step
+                    pos["fees_paid_trade"] += exit_fee
+                    pos["remaining_qty"] = 0.0
+                    pos["remaining_margin"] = 0.0
+                    pos["remaining_fraction"] = 0.0
+
+                    self.state["free_balance"] += (margin_released + net_step)
+                    self.state["realized_pnl"] += net_step
+                    self.state["total_fees"] += exit_fee
+                    self.state["total_closed"] += 1
+                    if pos["realized_pnl_trade"] >= 0:
+                        self.state["win_count"] += 1
+                    else:
+                        self.state["loss_count"] += 1
+
+                    self.state["open_positions"].pop(idx)
+                    self.update_drawdown()
+                    eq_after = self.total_equity()
+                    free_after = self.state["free_balance"]
+
+                    self.append_csv(pos["id"], "TP3_FULL_CLOSE", pos, exec_price, 30.0, gross, exit_fee, net_step, free_after, eq_after, "Hit TP3 Full Take Profit")
+                    title = f"🏆 [PAPER] ปิดกำไรครบ 3 เป้า! #{pos['id']} {sym}"
+                    lines_th = [
+                        f"🎯 ชนเป้า TP3 ที่ ${fmt_price(exec_price)} (ปิด 30% สุดท้าย = {net_step:+.2f} USDT)",
+                        f"💎 กำไรรวมสุทธิทั้งไม้: {pos['realized_pnl_trade']:+.2f} USDT (ค่าธรรมเนียมรวม ${pos['fees_paid_trade']:.2f})",
+                        f"📊 สถิติพอร์ต: Equity ${eq_after:.2f} | Win Rate {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L) | Max DD {self.state['max_drawdown_pct']:.2f}%",
+                    ]
+                    notifications.append((title, sym, lines_th, 0x00E676))
+                    continue
+
                 idx += 1
-                continue
 
-            pos["last_price"] = price
+            self.update_drawdown()
+            self.save_state()
+
+        for title, sym, lines_th, color in notifications:
+            print(f"\n   {title}")
+            for ln in lines_th:
+                print(f"      {ln}")
+            if notify:
+                send_paper_webhook(title, sym, lines_th, color)
+
+    def close_position_by_id(self, trade_id, market_prices=None, notify=True):
+        notif = None
+        res = None
+        with self._lock:
+            idx = next((i for i, p in enumerate(self.state["open_positions"]) if p["id"] == trade_id), None)
+            if idx is None:
+                return None
+            pos = self.state["open_positions"].pop(idx)
+            sym = pos["symbol"]
+            exec_price = float(market_prices.get(sym, 0.0)) if market_prices else 0.0
+            if exec_price <= 0:
+                exec_price = pos["last_price"]
+            pos["last_price"] = exec_price
+
             is_long = pos["side"] == "Long"
+            fee_rate = PAPER_TAKER_FEE_PCT / 100.0
+            close_qty = pos["remaining_qty"]
+            gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
+            exit_fee = (close_qty * exec_price) * fee_rate
+            raw_net = gross - exit_fee
+            returned_cash = max(0.0, pos["remaining_margin"] + raw_net)
+            net_step = returned_cash - pos["remaining_margin"]
 
-            # 1. เช็ค Stop Loss
-            sl_hit = (price <= pos["current_sl"]) if is_long else (price >= pos["current_sl"])
-            if sl_hit:
-                close_qty = pos["remaining_qty"]
-                exec_price = price
-                gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
-                exit_fee = (close_qty * exec_price) * fee_rate
-                raw_net = gross - exit_fee
-                returned_cash = max(0.0, pos["remaining_margin"] + raw_net)
-                net_step = returned_cash - pos["remaining_margin"]
+            pos["realized_pnl_trade"] += net_step
+            pos["fees_paid_trade"] += exit_fee
+            pos["remaining_qty"] = 0.0
+            pos["remaining_margin"] = 0.0
+            pos["remaining_fraction"] = 0.0
 
-                pos["realized_pnl_trade"] += net_step
-                pos["fees_paid_trade"] += exit_fee
-                pos["remaining_qty"] = 0.0
-                pos["remaining_margin"] = 0.0
-                pos["remaining_fraction"] = 0.0
+            self.state["free_balance"] += returned_cash
+            self.state["realized_pnl"] += net_step
+            self.state["total_fees"] += exit_fee
+            self.state["total_closed"] += 1
+            if pos["realized_pnl_trade"] >= 0:
+                self.state["win_count"] += 1
+            else:
+                self.state["loss_count"] += 1
 
-                self.state["free_balance"] += returned_cash
-                self.state["realized_pnl"] += net_step
-                self.state["total_fees"] += exit_fee
-                self.state["total_closed"] += 1
-                if pos["realized_pnl_trade"] >= 0:
-                    self.state["win_count"] += 1
-                else:
-                    self.state["loss_count"] += 1
+            self.update_drawdown()
+            eq_after = self.total_equity()
+            free_after = self.state["free_balance"]
+            pct_closed = (close_qty / pos["initial_qty"]) * 100.0 if pos["initial_qty"] > 0 else 100.0
+            self.append_csv(pos["id"], "MANUAL_CLOSE", pos, exec_price, pct_closed, gross, exit_fee, net_step, free_after, eq_after, "Closed manually via Telegram")
+            self.save_state()
 
-                self.state["open_positions"].pop(idx)
-                self.update_drawdown()
-                eq_after = self.total_equity()
-                free_after = self.state["free_balance"]
+            icon = "✅" if pos["realized_pnl_trade"] >= 0 else "🛑"
+            side_str = "LONG" if is_long else "SHORT"
+            title = f"{icon} [PAPER] ปิดมือ #{pos['id']} {sym} — สั่งปิดจาก Telegram"
+            lines_th = [
+                f"📌 สถานะ: {side_str} (ปิดด้วยตนเอง)",
+                f"🎯 Entry: ${fmt_price(pos['entry_price'])} -> Exit: ${fmt_price(exec_price)}",
+                f"💵 กำไร/ขาดทุนสุทธิไม้นี้: {pos['realized_pnl_trade']:+.2f} USDT (ค่าธรรมเนียมรวม ${pos['fees_paid_trade']:.2f})",
+                f"📊 สถิติพอร์ต: Equity ${eq_after:.2f} | Win Rate {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L)",
+            ]
+            notif = (title, sym, lines_th, 0x00E676 if pos["realized_pnl_trade"] >= 0 else 0xFF5252)
+            res = (sym, pos["realized_pnl_trade"])
 
-                if pos["tp2_hit"]:
-                    reason = "TRAILING_SL_TP1"
-                    label = "Trailing SL @ TP1 (ล็อกกำไรสำเร็จ)"
-                elif pos["tp1_hit"]:
-                    reason = "BREAKEVEN_SL"
-                    label = "Breakeven SL (กันทุนหลังชน TP1)"
-                else:
-                    reason = "STOP_LOSS"
-                    label = "Stop Loss (ตัดขาดทุนตามแผน)"
+        print(f"\n   {notif[0]}")
+        for ln in notif[2]:
+            print(f"      {ln}")
+        if notify:
+            send_paper_webhook(*notif)
+        return res
 
-                pct_closed = (close_qty / pos["initial_qty"]) * 100.0 if pos["initial_qty"] > 0 else 100.0
-                self.append_csv(pos["id"], reason, pos, exec_price, pct_closed, gross, exit_fee, net_step, free_after, eq_after, reason)
-
-                icon = "✅" if pos["realized_pnl_trade"] >= 0 else "🛑"
-                side_str = "LONG" if is_long else "SHORT"
-                title = f"{icon} [PAPER] ปิดไม้ #{pos['id']} {sym} — {label}"
-                lines_th = [
-                    f"📌 สถานะ: {side_str} ({label})",
-                    f"🎯 Entry: ${fmt_price(pos['entry_price'])} -> Exit: ${fmt_price(exec_price)}",
-                    f"💵 กำไร/ขาดทุนสุทธิไม้นี้: {pos['realized_pnl_trade']:+.2f} USDT (ค่าธรรมเนียมรวม ${pos['fees_paid_trade']:.2f})",
-                    f"📊 สถิติพอร์ต: Equity ${eq_after:.2f} | Win Rate {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L) | Max DD {self.state['max_drawdown_pct']:.2f}%",
-                ]
-                print(f"\n   {title}")
-                for ln in lines_th:
-                    print(f"      {ln}")
-                if notify:
-                    send_paper_webhook(title, sym, lines_th, 0x00E676 if pos["realized_pnl_trade"] >= 0 else 0xFF5252)
-                continue
-
-            # 2. เช็ค TP1 (ปิด 40% + เลื่อน SL กันทุน)
-            tp1_hit_now = (not pos["tp1_hit"]) and ((price >= pos["tp1"]) if is_long else (price <= pos["tp1"]))
-            if tp1_hit_now:
-                frac = 0.40
-                close_qty = pos["initial_qty"] * frac
-                margin_released = pos["initial_margin"] * frac
-                exec_price = pos["tp1"]
-                gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
-                exit_fee = (close_qty * exec_price) * fee_rate
-                net_step = gross - exit_fee
-
-                pos["tp1_hit"] = True
-                pos["remaining_qty"] = max(0.0, pos["remaining_qty"] - close_qty)
-                pos["remaining_margin"] = max(0.0, pos["remaining_margin"] - margin_released)
-                pos["remaining_fraction"] = max(0.0, pos["remaining_fraction"] - frac)
-                pos["realized_pnl_trade"] += net_step
-                pos["fees_paid_trade"] += exit_fee
-
-                be_buffer = fee_rate * 2.2
-                pos["current_sl"] = pos["entry_price"] * (1.0 + be_buffer) if is_long else pos["entry_price"] * (1.0 - be_buffer)
-
-                self.state["free_balance"] += (margin_released + net_step)
-                self.state["realized_pnl"] += net_step
-                self.state["total_fees"] += exit_fee
-                self.update_drawdown()
-                eq_after = self.total_equity()
-                free_after = self.state["free_balance"]
-
-                self.append_csv(pos["id"], "TP1_PARTIAL", pos, exec_price, 40.0, gross, exit_fee, net_step, free_after, eq_after, "Closed 40% & Moved SL to Breakeven")
-                title = f"💰 [PAPER] TP1 แตก! #{pos['id']} {sym} (+ปิด 40%)"
-                lines_th = [
-                    f"🎯 ชนเป้า TP1 ที่ ${fmt_price(exec_price)} (เก็บกำไร 40% = {net_step:+.2f} USDT)",
-                    f"🛡️ เลื่อน SL กันทุน (Breakeven) อัตโนมัติ -> ${fmt_price(pos['current_sl'])}",
-                    f"💼 เหลือถือรันต่อ 60% ลุ้น TP2 (${fmt_price(pos['tp2'])}) / TP3 (${fmt_price(pos['tp3'])}) | Equity ${eq_after:.2f}",
-                ]
-                print(f"\n   {title}")
-                for ln in lines_th:
-                    print(f"      {ln}")
-                if notify:
-                    send_paper_webhook(title, sym, lines_th, 0x00E676)
-
-            # 3. เช็ค TP2 (ปิด 30% + เลื่อน SL ล็อกกำไรที่ TP1)
-            tp2_hit_now = pos["tp1_hit"] and (not pos["tp2_hit"]) and ((price >= pos["tp2"]) if is_long else (price <= pos["tp2"]))
-            if tp2_hit_now:
-                frac = 0.30
-                close_qty = pos["initial_qty"] * frac
-                margin_released = pos["initial_margin"] * frac
-                exec_price = pos["tp2"]
-                gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
-                exit_fee = (close_qty * exec_price) * fee_rate
-                net_step = gross - exit_fee
-
-                pos["tp2_hit"] = True
-                pos["remaining_qty"] = max(0.0, pos["remaining_qty"] - close_qty)
-                pos["remaining_margin"] = max(0.0, pos["remaining_margin"] - margin_released)
-                pos["remaining_fraction"] = max(0.0, pos["remaining_fraction"] - frac)
-                pos["realized_pnl_trade"] += net_step
-                pos["fees_paid_trade"] += exit_fee
-                pos["current_sl"] = pos["tp1"]
-
-                self.state["free_balance"] += (margin_released + net_step)
-                self.state["realized_pnl"] += net_step
-                self.state["total_fees"] += exit_fee
-                self.update_drawdown()
-                eq_after = self.total_equity()
-                free_after = self.state["free_balance"]
-
-                self.append_csv(pos["id"], "TP2_PARTIAL", pos, exec_price, 30.0, gross, exit_fee, net_step, free_after, eq_after, "Closed 30% & Trailed SL to TP1")
-                title = f"🚀 [PAPER] TP2 แตก! #{pos['id']} {sym} (+ปิดอีก 30%)"
-                lines_th = [
-                    f"🎯 ชนเป้า TP2 ที่ ${fmt_price(exec_price)} (เก็บกำไรเพิ่ม 30% = {net_step:+.2f} USDT)",
-                    f"🔒 เลื่อน Trailing SL ล็อกกำไรที่ TP1 -> ${fmt_price(pos['current_sl'])}",
-                    f"💼 เหลือถือรันต่อ 30% ลุ้น TP3 (${fmt_price(pos['tp3'])}) | Equity ${eq_after:.2f}",
-                ]
-                print(f"\n   {title}")
-                for ln in lines_th:
-                    print(f"      {ln}")
-                if notify:
-                    send_paper_webhook(title, sym, lines_th, 0x00E676)
-
-            # 4. เช็ค TP3 (ปิด 30% สุดท้าย)
-            tp3_hit_now = pos["tp2_hit"] and ((price >= pos["tp3"]) if is_long else (price <= pos["tp3"]))
-            if tp3_hit_now:
-                close_qty = pos["remaining_qty"]
-                margin_released = pos["remaining_margin"]
-                exec_price = pos["tp3"]
-                gross = ((exec_price - pos["entry_price"]) if is_long else (pos["entry_price"] - exec_price)) * close_qty
-                exit_fee = (close_qty * exec_price) * fee_rate
-                net_step = gross - exit_fee
-
-                pos["realized_pnl_trade"] += net_step
-                pos["fees_paid_trade"] += exit_fee
-                pos["remaining_qty"] = 0.0
-                pos["remaining_margin"] = 0.0
-                pos["remaining_fraction"] = 0.0
-
-                self.state["free_balance"] += (margin_released + net_step)
-                self.state["realized_pnl"] += net_step
-                self.state["total_fees"] += exit_fee
-                self.state["total_closed"] += 1
-                if pos["realized_pnl_trade"] >= 0:
-                    self.state["win_count"] += 1
-                else:
-                    self.state["loss_count"] += 1
-
-                self.state["open_positions"].pop(idx)
-                self.update_drawdown()
-                eq_after = self.total_equity()
-                free_after = self.state["free_balance"]
-
-                self.append_csv(pos["id"], "TP3_FULL_CLOSE", pos, exec_price, 30.0, gross, exit_fee, net_step, free_after, eq_after, "Hit TP3 Full Take Profit")
-                title = f"🏆 [PAPER] ปิดกำไรครบ 3 เป้า! #{pos['id']} {sym}"
-                lines_th = [
-                    f"🎯 ชนเป้า TP3 ที่ ${fmt_price(exec_price)} (ปิด 30% สุดท้าย = {net_step:+.2f} USDT)",
-                    f"💎 กำไรรวมสุทธิทั้งไม้: {pos['realized_pnl_trade']:+.2f} USDT (ค่าธรรมเนียมรวม ${pos['fees_paid_trade']:.2f})",
-                    f"📊 สถิติพอร์ต: Equity ${eq_after:.2f} | Win Rate {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L) | Max DD {self.state['max_drawdown_pct']:.2f}%",
-                ]
-                print(f"\n   {title}")
-                for ln in lines_th:
-                    print(f"      {ln}")
-                if notify:
-                    send_paper_webhook(title, sym, lines_th, 0x00E676)
-                continue
-
-            idx += 1
-
-        self.update_drawdown()
-        self.save_state()
+    def close_all_positions(self, market_prices=None, notify=True):
+        with self._lock:
+            ids = [p["id"] for p in self.state["open_positions"]]
+        cnt = 0
+        sum_pnl = 0.0
+        for tid in ids:
+            res = self.close_position_by_id(tid, market_prices=market_prices, notify=notify)
+            if res is not None:
+                cnt += 1
+                sum_pnl += res[1]
+        return cnt, sum_pnl
 
     def print_portfolio_summary(self):
-        eq = self.total_equity()
-        init_bal = self.state["initial_balance"]
+        st = self.get_state_snapshot()
+        eq = self.state_total_equity(st)
+        init_bal = st["initial_balance"]
         net_pct = ((eq - init_bal) / init_bal * 100.0) if init_bal > 0 else 0.0
+        pause_txt = " [พักเปิดไม้ใหม่ ⏸️]" if st.get("paused_opening") else ""
         print("\n--------------------------------------------------------------")
-        print(f"💼 พอร์ตจำลอง (Paper Trading) | Equity: ${eq:.2f} ({net_pct:+.2f}%) | ทุนตั้งต้น: ${init_bal:.2f}")
-        print(f"   • เงินว่าง: ${self.state['free_balance']:.2f} | Margin ถืออยู่: ${self.locked_margin():.2f} | uPnL: {self.unrealized_pnl():+.2f} USDT")
-        print(f"   • ปิดไม้แล้ว: {self.state['total_closed']} | Win Rate: {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L) | Realized: {self.state['realized_pnl']:+.2f} | Max DD: {self.state['max_drawdown_pct']:.2f}%")
-        if not self.state["open_positions"]:
+        print(f"💼 พอร์ตจำลอง (Paper Trading){pause_txt} | Equity: ${eq:.2f} ({net_pct:+.2f}%) | ทุนตั้งต้น: ${init_bal:.2f}")
+        print(f"   • เงินว่าง: ${st['free_balance']:.2f} | Margin ถืออยู่: ${self.state_locked_margin(st):.2f} | uPnL: {self.state_unrealized_pnl(st):+.2f} USDT")
+        print(f"   • ปิดไม้แล้ว: {st['total_closed']} | Win Rate: {self.state_win_rate_pct(st):.1f}% ({st['win_count']}W/{st['loss_count']}L) | Realized: {st['realized_pnl']:+.2f} | Max DD: {st['max_drawdown_pct']:.2f}%")
+        if not st["open_positions"]:
             print("   • ออเดอร์ที่ถืออยู่: ไม่มี (รอสัญญาณ ⭐⭐/⭐⭐⭐)")
         else:
-            print(f"   • ออเดอร์ที่ถืออยู่ ({len(self.state['open_positions'])}/{PAPER_MAX_OPEN_POSITIONS}):")
-            for p in self.state["open_positions"]:
+            print(f"   • ออเดอร์ที่ถืออยู่ ({len(st['open_positions'])}/{PAPER_MAX_OPEN_POSITIONS}):")
+            for p in st["open_positions"]:
                 upnl = self.pos_unrealized_pnl(p)
                 uroe = self.pos_unrealized_roe_pct(p)
                 side_str = "🟢 LONG" if p["side"] == "Long" else "🔴 SHORT"
@@ -967,6 +1240,457 @@ class PaperTrader:
 
 
 paper_trader = PaperTrader()
+scan_now_event = threading.Event()
+scan_in_progress_lock = threading.Lock()
+
+
+def render_dashboard_html(st, notice_line=None):
+    eq = PaperTrader.state_total_equity(st)
+    init_bal = st["initial_balance"]
+    net_usdt = eq - init_bal
+    net_pct = (net_usdt / init_bal * 100.0) if init_bal > 0 else 0.0
+    status_badge = "⏸️ พักเปิดไม้ใหม่ชั่วคราว" if st.get("paused_opening") else "🟢 เปิดรับสัญญาณอัตโนมัติ"
+
+    lines = []
+    if notice_line:
+        lines.append(f"ℹ️ <i>{html.escape(str(notice_line))}</i>")
+        lines.append("")
+    lines.append("💼 <b>พอร์ตจำลองการเทรด (Paper Trading Dashboard)</b>")
+    lines.append(f"• สถานะเปิดไม้ใหม่: <code>{status_badge}</code>")
+    lines.append(f"• มูลค่าพอร์ต (Equity): <code>${eq:.2f}</code> (<code>{net_usdt:+.2f} USDT | {net_pct:+.2f}%</code>)")
+    lines.append(
+        f"• ทุนตั้งต้น: <code>${init_bal:.2f}</code> | เงินว่าง: <code>${st['free_balance']:.2f}</code> | Margin ถืออยู่: <code>${PaperTrader.state_locked_margin(st):.2f}</code>"
+    )
+    lines.append(
+        f"• uPnL: <code>{PaperTrader.state_unrealized_pnl(st):+.2f} USDT</code> | Realized: <code>{st['realized_pnl']:+.2f} USDT</code> | ค่าธรรมเนียม: <code>${st['total_fees']:.2f}</code>"
+    )
+    lines.append(
+        f"• สถิติ: <code>{st['total_closed']} ไม้</code> | Win Rate <code>{PaperTrader.state_win_rate_pct(st):.1f}%</code> (<code>{st['win_count']}W/{st['loss_count']}L</code>) | Max DD <code>{st['max_drawdown_pct']:.2f}%</code>"
+    )
+    lines.append("")
+
+    open_pos = st.get("open_positions", [])
+    if not open_pos:
+        lines.append(f"📌 <b>ออเดอร์ที่ถืออยู่ (0/{PAPER_MAX_OPEN_POSITIONS}):</b> ยังไม่มี (รอสัญญาณ ≥ {PAPER_MIN_STARS} ดาว)")
+    else:
+        lines.append(f"📌 <b>ออเดอร์ที่ถืออยู่ ({len(open_pos)}/{PAPER_MAX_OPEN_POSITIONS} ไม้):</b>")
+        for idx, p in enumerate(open_pos, start=1):
+            side_icon = "🟢 LONG" if p["side"] == "Long" else "🔴 SHORT"
+            stage = "TP1+TP2 (ถือ 30%)" if p["tp2_hit"] else ("กันทุน BE (ถือ 60%)" if p["tp1_hit"] else "รอ TP1 (ถือ 100%)")
+            upnl = PaperTrader.pos_unrealized_pnl(p)
+            uroe = PaperTrader.pos_unrealized_roe_pct(p)
+            lines.append(
+                f"{idx}) #{p['id']} {side_icon} <b>{html.escape(p['symbol'])}</b> | <code>${fmt_price(p['entry_price'])}</code> → <code>${fmt_price(p['last_price'])}</code>"
+            )
+            lines.append(
+                f"   uPnL: <code>{upnl:+.2f} USDT ({uroe:+.1f}%)</code> | SL: <code>${fmt_price(p['current_sl'])}</code> | {stage}"
+            )
+
+    lines.append(f"\n🕒 <i>อัปเดตล่าสุด: {datetime.now().strftime('%H:%M:%S')}</i>")
+
+    toggle_btn = (
+        {"text": "▶️ เปิดรับไม้ใหม่", "callback_data": "paper:resume"}
+        if st.get("paused_opening")
+        else {"text": "⏸️ พักเปิดไม้ใหม่", "callback_data": "paper:pause"}
+    )
+    rows = [
+        [
+            {"text": "🔄 รีเฟรชพอร์ต", "callback_data": "paper:refresh"},
+            {"text": "📜 ประวัติ 10 รายการ", "callback_data": "paper:history"},
+        ],
+        [
+            toggle_btn,
+            {"text": "🔍 สแกนทันที", "callback_data": "paper:scan"},
+        ],
+    ]
+    if open_pos:
+        rows.append(
+            [
+                {"text": "📋 ปิดออเดอร์รายตัว", "callback_data": "paper:manage"},
+                {"text": "❌ ปิดทุกไม้ทันที", "callback_data": "paper:close_all_prompt"},
+            ]
+        )
+    rows.append([{"text": f"🔄 รีเซ็ตพอร์ต (${PAPER_INITIAL_BALANCE:.0f})", "callback_data": "paper:reset_prompt"}])
+    return "\n".join(lines), rows
+
+
+def render_manage_html(st):
+    open_pos = st.get("open_positions", [])
+    if not open_pos:
+        return (
+            "📋 <b>จัดการออเดอร์ที่เปิดอยู่</b>\n\nไม่มีออเดอร์ที่ถืออยู่ในขณะนี้",
+            [[{"text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh"}]],
+        )
+    lines = ["📋 <b>จัดการออเดอร์ที่เปิดอยู่ (เลือกกดเพื่อปิดทันที)</b>", ""]
+    rows = []
+    for p in open_pos:
+        upnl = PaperTrader.pos_unrealized_pnl(p)
+        uroe = PaperTrader.pos_unrealized_roe_pct(p)
+        side_icon = "🟢" if p["side"] == "Long" else "🔴"
+        lines.append(
+            f"• #{p['id']} {side_icon} <b>{html.escape(p['symbol'])}</b> | ราคา <code>${fmt_price(p['last_price'])}</code> | uPnL <code>{upnl:+.2f} ({uroe:+.1f}%)</code>"
+        )
+        rows.append([{"text": f"❌ ปิด #{p['id']} {p['symbol']} ({upnl:+.2f} USDT)", "callback_data": f"paper:close:{p['id']}"}])
+    rows.append(
+        [
+            {"text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh"},
+            {"text": "❌ ปิดทุกไม้", "callback_data": "paper:close_all_prompt"},
+        ]
+    )
+    return "\n".join(lines), rows
+
+
+def render_history_html(rows):
+    lines = ["📜 <b>ประวัติจำลองการเทรด 10 รายการล่าสุด</b>", ""]
+    if not rows:
+        lines.append("ยังไม่มีประวัติการเปิด/ปิดออเดอร์จำลอง")
+    else:
+        icon_map = {
+            "OPEN": "🧪",
+            "TP1_PARTIAL": "💰",
+            "TP2_PARTIAL": "🚀",
+            "TP3_FULL_CLOSE": "🏆",
+            "BREAKEVEN_SL": "✅",
+            "TRAILING_SL_TP1": "✅",
+            "MANUAL_CLOSE": "❌",
+            "STOP_LOSS": "🛑",
+        }
+        for r in rows:
+            ts = r["timestamp"][11:19] if len(r["timestamp"]) >= 19 else r["timestamp"]
+            icon = icon_map.get(r["event"], "📌")
+            lines.append(
+                f"{icon} <code>{html.escape(ts)}</code> #{html.escape(str(r['trade_id']))} <b>{html.escape(r['symbol'])}</b> ({html.escape(r['side'])}) | "
+                f"<code>{html.escape(r['event'])}</code> | ${fmt_price(r['exec_price'])} | <code>{r['net_pnl']:+.2f} USDT</code>"
+            )
+    kb = [
+        [
+            {"text": "🔄 รีเฟรชประวัติ", "callback_data": "paper:history"},
+            {"text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh"},
+        ]
+    ]
+    return "\n".join(lines), kb
+
+
+def render_close_all_confirm_html(st):
+    open_pos = st.get("open_positions", [])
+    if not open_pos:
+        return (
+            "ℹ️ ไม่มีออเดอร์ที่เปิดอยู่ในขณะนี้",
+            [[{"text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh"}]],
+        )
+    text = (
+        f"⚠️ <b>ยืนยันปิดออเดอร์จำลองทั้งหมด ({len(open_pos)} ไม้)</b>\n\n"
+        f"ระบบจะปิดทุกไม้ที่ถืออยู่ด้วยราคาตลาดปัจจุบันทันที (uPnL รวม <code>{PaperTrader.state_unrealized_pnl(st):+.2f} USDT</code>)\n"
+        "ต้องการดำเนินการต่อหรือไม่?"
+    )
+    kb = [
+        [
+            {"text": "✅ ยืนยันปิดทุกไม้ทันที", "callback_data": "paper:close_all_confirm"},
+            {"text": "⬅️ ยกเลิก", "callback_data": "paper:refresh"},
+        ]
+    ]
+    return text, kb
+
+
+def render_reset_confirm_html():
+    text = (
+        "⚠️ <b>ยืนยันการรีเซ็ตพอร์ตจำลอง</b>\n\n"
+        f"การรีเซ็ตจะล้างออเดอร์ที่ถืออยู่ทั้งหมด สถิติ Win Rate และไฟล์ประวัติเทรด CSV แล้วตั้งต้นใหม่เป็น <code>${PAPER_INITIAL_BALANCE:.2f} USDT</code>\n"
+        "ต้องการยืนยันหรือไม่?"
+    )
+    kb = [
+        [
+            {"text": "✅ ยืนยันรีเซ็ตพอร์ต", "callback_data": "paper:reset_confirm"},
+            {"text": "⬅️ ยกเลิก", "callback_data": "paper:refresh"},
+        ]
+    ]
+    return text, kb
+
+
+class TelegramPaperBotController:
+    def __init__(self, trader):
+        self.trader = trader
+        self._started = False
+
+    @staticmethod
+    def is_enabled():
+        return PAPER_TRADING_ENABLED and PAPER_TELEGRAM_BOT_ENABLED and bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+    def send_dashboard_message(self, refresh_prices=True, notice=None):
+        if not self.is_enabled():
+            return
+        if refresh_prices and self.trader.get_state_snapshot().get("open_positions"):
+            try:
+                pmap = fetch_all_prices()
+                self.trader.update_prices(pmap)
+            except Exception as e:
+                print(f"⚠️ อัปเดตราคาบน Telegram Dashboard ไม่สำเร็จ: {e}")
+        st = self.trader.get_state_snapshot()
+        html_text, kb = render_dashboard_html(st, notice_line=notice)
+        try:
+            tg_send_html(html_text, kb)
+        except Exception as e:
+            print(f"⚠️ ส่ง Telegram Portfolio Dashboard ไม่สำเร็จ: {e}")
+
+    def start(self):
+        if self._started or not self.is_enabled():
+            return
+        self._started = True
+
+        t = threading.Thread(target=self._poll_loop, daemon=True)
+        t.start()
+
+        if PAPER_TELEGRAM_SUMMARY_MINS > 0:
+            tp = threading.Thread(target=self._periodic_summary_loop, daemon=True)
+            tp.start()
+
+    def _periodic_summary_loop(self):
+        interval = max(60, PAPER_TELEGRAM_SUMMARY_MINS * 60)
+        while True:
+            time.sleep(interval)
+            self.send_dashboard_message(refresh_prices=True, notice="⏰ สรุปพอร์ตจำลองตามรอบเวลา")
+
+    def _is_authorized(self, chat_id):
+        return str(chat_id) == str(TELEGRAM_CHAT_ID)
+
+    def _poll_loop(self):
+        print("🤖 เปิดใช้งาน Telegram Bot Listener สำหรับดูพอร์ตจำลองและปุ่มสั่งการเรียลไทม์")
+        tg_set_commands()
+
+        next_offset = None
+        try:
+            stale = tg_api_post(
+                "getUpdates",
+                {"offset": -1, "timeout": 0, "allowed_updates": ["message", "callback_query"]},
+                timeout=10,
+            ).get("result", [])
+            if stale:
+                next_offset = max(u.get("update_id", 0) for u in stale) + 1
+        except Exception:
+            pass
+
+        while True:
+            try:
+                payload = {"timeout": 18, "allowed_updates": ["message", "callback_query"]}
+                if next_offset is not None:
+                    payload["offset"] = next_offset
+                resp = tg_api_post("getUpdates", payload, timeout=25)
+                for upd in resp.get("result", []):
+                    uid = upd.get("update_id")
+                    if uid is not None:
+                        next_offset = uid + 1
+                    self._handle_update(upd)
+            except Exception as e:
+                err_str = str(e)
+                if "409" in err_str or "Conflict" in err_str:
+                    print("⚠️ พบ Telegram getUpdates ซ้อน (409 Conflict) — รอ 10 วินาทีแล้วลองใหม่")
+                    time.sleep(10)
+                else:
+                    time.sleep(5)
+
+    def _handle_update(self, upd):
+        if "callback_query" in upd:
+            cb = upd["callback_query"]
+            cb_id = cb.get("id", "")
+            data = cb.get("data", "")
+            msg = cb.get("message", {})
+            chat_id = msg.get("chat", {}).get("id", 0)
+            msg_id = msg.get("message_id", 0)
+            if not self._is_authorized(chat_id):
+                tg_answer_callback(cb_id, "⛔ เฉพาะเจ้าของบอทเท่านั้น", show_alert=True)
+                return
+            self._handle_callback(cb_id, data, chat_id, msg_id)
+            return
+
+        if "message" in upd:
+            msg = upd["message"]
+            chat_id = msg.get("chat", {}).get("id", 0)
+            if not self._is_authorized(chat_id):
+                return
+            text = (msg.get("text") or "").strip()
+            if text.startswith("/"):
+                cmd = text.split()[0].split("@")[0].lower()
+                self._handle_command(cmd)
+
+    def _handle_command(self, cmd):
+        if cmd in ("/start", "/portfolio", "/status", "/positions"):
+            self.send_dashboard_message(refresh_prices=True)
+        elif cmd == "/history":
+            rows = self.trader.recent_csv_events(10)
+            html_text, kb = render_history_html(rows)
+            try:
+                tg_send_html(html_text, kb)
+            except Exception:
+                pass
+        elif cmd == "/pause":
+            st = self.trader.set_paused(True)
+            html_text, kb = render_dashboard_html(st, notice_line="⏸️ พักการเปิดออเดอร์ใหม่แล้ว (ออเดอร์ที่ถืออยู่ยังรัน TP/SL ต่อ)")
+            try:
+                tg_send_html(html_text, kb)
+            except Exception:
+                pass
+        elif cmd == "/resume":
+            st = self.trader.set_paused(False)
+            html_text, kb = render_dashboard_html(st, notice_line="▶️ เปิดรับออเดอร์จำลองใหม่อีกครั้งแล้ว")
+            try:
+                tg_send_html(html_text, kb)
+            except Exception:
+                pass
+        elif cmd == "/scan":
+            if scan_in_progress_lock.locked():
+                try:
+                    tg_send_html("⏳ ขณะนี้กำลังสแกนตลาดอยู่แล้ว กรุณารอสักครู่...", None)
+                except Exception:
+                    pass
+            else:
+                try:
+                    tg_send_html("🔍 กำลังเริ่มสแกนตลาด MTF ทันที...", None)
+                except Exception:
+                    pass
+                scan_now_event.set()
+        elif cmd == "/closeall":
+            st = self.trader.get_state_snapshot()
+            html_text, kb = render_close_all_confirm_html(st)
+            try:
+                tg_send_html(html_text, kb)
+            except Exception:
+                pass
+        elif cmd == "/reset":
+            html_text, kb = render_reset_confirm_html()
+            try:
+                tg_send_html(html_text, kb)
+            except Exception:
+                pass
+        elif cmd == "/help":
+            help_text = (
+                "🤖 <b>คำสั่งควบคุมพอร์ตจำลอง (Scanner-f)</b>\n"
+                "• /portfolio — ดูสรุปพอร์ตจำลอง + ปุ่มสั่งการ\n"
+                "• /history — ดูประวัติการเทรด 10 รายการล่าสุด\n"
+                "• /scan — สแกนตลาด MTF ทันที 1 รอบ\n"
+                "• /pause — พักการเปิดออเดอร์ใหม่ชั่วคราว\n"
+                "• /resume — เปิดรับออเดอร์ใหม่อีกครั้ง\n"
+                "• /closeall — ปิดออเดอร์จำลองทั้งหมดทันที (มีหน้ายืนยัน)\n"
+                "• /reset — รีเซ็ตพอร์ตจำลองกลับเป็นทุนเริ่มต้น (มีหน้ายืนยัน)"
+            )
+            try:
+                tg_send_html(help_text, [[{"text": "💼 เปิดพอร์ตจำลอง + ปุ่มสั่งการ", "callback_data": "paper:panel"}]])
+            except Exception:
+                pass
+
+    def _handle_callback(self, cb_id, data, chat_id, msg_id):
+        try:
+            if data == "paper:panel":
+                tg_answer_callback(cb_id, "💼 กำลังเปิดหน้าพอร์ตล่าสุด...")
+                self.send_dashboard_message(refresh_prices=True)
+            elif data == "paper:refresh":
+                tg_answer_callback(cb_id, "🔄 อัปเดตราคาและพอร์ตล่าสุดแล้ว")
+                try:
+                    pmap = fetch_all_prices()
+                    self.trader.update_prices(pmap)
+                except Exception:
+                    pass
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_dashboard_html(st)
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:history":
+                tg_answer_callback(cb_id, "📜 โหลดประวัติเทรดล่าสุดแล้ว")
+                rows = self.trader.recent_csv_events(10)
+                html_text, kb = render_history_html(rows)
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:history_new":
+                tg_answer_callback(cb_id, "📜 เปิดประวัติเทรดล่าสุดแล้ว")
+                rows = self.trader.recent_csv_events(10)
+                html_text, kb = render_history_html(rows)
+                tg_send_html(html_text, kb)
+            elif data == "paper:pause":
+                tg_answer_callback(cb_id, "⏸️ พักการเปิดไม้ใหม่แล้ว")
+                st = self.trader.set_paused(True)
+                html_text, kb = render_dashboard_html(st, notice_line="⏸️ พักการเปิดออเดอร์ใหม่ชั่วคราว (ออเดอร์เดิมยังดูแล TP/SL ตามปกติ)")
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:resume":
+                tg_answer_callback(cb_id, "▶️ เปิดรับออเดอร์ใหม่แล้ว")
+                st = self.trader.set_paused(False)
+                html_text, kb = render_dashboard_html(st, notice_line="▶️ เปิดรับออเดอร์จำลองจากสัญญาณ 2-3 ดาวแล้ว")
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:scan":
+                if scan_in_progress_lock.locked():
+                    tg_answer_callback(cb_id, "⏳ กำลังสแกนตลาดอยู่แล้ว กรุณารอสักครู่...")
+                else:
+                    tg_answer_callback(cb_id, "🔍 กำลังเริ่มสแกนตลาดรอบใหม่ทันที!")
+                    scan_now_event.set()
+                try:
+                    if self.trader.get_state_snapshot().get("open_positions"):
+                        pmap = fetch_all_prices()
+                        self.trader.update_prices(pmap)
+                except Exception:
+                    pass
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_dashboard_html(st, notice_line="🔍 รับคำสั่งสแกนตลาด MTF ทันทีแล้ว")
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:manage":
+                tg_answer_callback(cb_id, "📋 เลือกออเดอร์ที่ต้องการปิด")
+                try:
+                    pmap = fetch_all_prices()
+                    self.trader.update_prices(pmap)
+                except Exception:
+                    pass
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_manage_html(st)
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:close_all_prompt":
+                tg_answer_callback(cb_id)
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_close_all_confirm_html(st)
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:close_all_confirm":
+                pmap = None
+                try:
+                    pmap = fetch_all_prices()
+                except Exception:
+                    pass
+                cnt, sum_pnl = self.trader.close_all_positions(market_prices=pmap)
+                tg_answer_callback(cb_id, f"❌ ปิดทั้งหมด {cnt} ไม้ ({sum_pnl:+.2f} USDT)")
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_dashboard_html(st, notice_line=f"❌ ปิดออเดอร์ด้วยตนเอง {cnt} ไม้ (PnL รวม {sum_pnl:+.2f} USDT)")
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:reset_prompt":
+                tg_answer_callback(cb_id)
+                html_text, kb = render_reset_confirm_html()
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:reset_confirm":
+                st = self.trader.reset_portfolio()
+                tg_answer_callback(cb_id, "🔄 รีเซ็ตพอร์ตจำลองกลับเป็นทุนเริ่มต้นเรียบร้อย!")
+                html_text, kb = render_dashboard_html(st, notice_line="🔄 รีเซ็ตพอร์ตและล้างประวัติเรียบร้อยแล้ว")
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data.startswith("paper:close:"):
+                try:
+                    tid = int(data.split(":", 2)[2])
+                except Exception:
+                    tg_answer_callback(cb_id)
+                    return
+                pmap = None
+                try:
+                    pmap = fetch_all_prices()
+                except Exception:
+                    pass
+                closed = self.trader.close_position_by_id(tid, market_prices=pmap)
+                if closed:
+                    sym, pnl = closed
+                    tg_answer_callback(cb_id, f"✅ ปิด #{tid} {sym} ({pnl:+.2f} USDT)")
+                    notice = f"✅ ปิดไม้ #{tid} {sym} แล้ว ({pnl:+.2f} USDT)"
+                else:
+                    tg_answer_callback(cb_id, "⚠️ ไม่พบไม้นี้ (อาจปิดไปแล้ว)")
+                    notice = None
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_dashboard_html(st, notice_line=notice)
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            else:
+                tg_answer_callback(cb_id)
+        except Exception as e:
+            print(f"⚠️ จัดการปุ่ม Telegram ไม่สำเร็จ: {e}")
+
+
+telegram_bot = TelegramPaperBotController(paper_trader)
 
 
 def dispatch_mtf_alert(
@@ -1508,10 +2232,48 @@ def run_paper_self_test():
         expected_eq = pt.state["initial_balance"] + pt.state["realized_pnl"] + pt.unrealized_pnl()
         assert abs(pt.total_equity() - expected_eq) < 1e-6
         assert os.path.exists(os.path.join(tmpdir, "trades.csv"))
-        print("✅ ทดสอบตรรกะระบบจำลองการเทรด (Paper Trading Self-Test 3 กรณี) ผ่าน 100%!")
+
+        # 4) Pause/Resume opening + Manual Close + CSV history & HTML Dashboard rendering
+        st_paused = pt.set_paused(True)
+        assert st_paused["paused_opening"] is True
+        assert pt.try_open_position("XRPUSDT", "BULL", "RSI_OS", "5m+15m+1h", 3, sol_plan, notify=False) is None
+
+        st_resumed = pt.set_paused(False)
+        assert st_resumed["paused_opening"] is False
+        tid4 = pt.try_open_position("ADA&TEST<1>", "BULL", "RSI_OS", "5m+15m+1h", 3, sol_plan, notify=False)
+        assert tid4 == 4
+
+        dash_html, dash_kb = render_dashboard_html(pt.get_state_snapshot(), notice_line="ทดสอบ <แจ้งเตือน> & ปุ่ม")
+        assert "&lt;แจ้งเตือน&gt;" in dash_html
+        assert "ADA&amp;TEST&lt;1&gt;" in dash_html
+        assert len(dash_kb) == 4  # Open position active -> Manage & Close All row appears
+
+        manage_html, manage_kb = render_manage_html(pt.get_state_snapshot())
+        assert "ADA&amp;TEST&lt;1&gt;" in manage_html
+        assert any(btn["callback_data"] == "paper:close:4" for row in manage_kb for btn in row)
+
+        closed = pt.close_position_by_id(4, market_prices={"ADA&TEST<1>": 103.0}, notify=False)
+        assert closed is not None and closed[1] > 0
+        assert pt.get_state_snapshot()["total_closed"] == 4
+        expected_eq_after = pt.state["initial_balance"] + pt.state["realized_pnl"] + pt.unrealized_pnl()
+        assert abs(pt.total_equity() - expected_eq_after) < 1e-6
+
+        hist_rows = pt.recent_csv_events(10)
+        assert len(hist_rows) >= 2
+        assert hist_rows[0]["event"] == "MANUAL_CLOSE"
+        hist_html, hist_kb = render_history_html(hist_rows)
+        assert "MANUAL_CLOSE" in hist_html
+        assert len(hist_kb) == 1
+
+        print("✅ ทดสอบตรรกะระบบจำลองการเทรด + Telegram Dashboard Self-Test (4 กรณี) ผ่าน 100%!")
 
 
 def main():
+    tg_bot_txt = (
+        "เปิด ✅ (แจ้งเตือน + พอร์ต & ปุ่มสั่งการ)"
+        if telegram_bot.is_enabled()
+        else ("เปิด ✅ (แจ้งเตือนอย่างเดียว)" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "ไม่ได้ตั้งค่า ⚪")
+    )
     print("==============================================================")
     print("📱 Scanner-f (MTF Edition: 5m + 15m + 1h) — Binance Futures")
     print("• ชุดวิเคราะห์ : 5m (จุดเข้า) + 15m (โมเมนตัม/SL) + 1h (เทรนด์หลัก/TP3)")
@@ -1520,7 +2282,7 @@ def main():
         f"• จำลองการเทรด : {'เปิด ✅' if PAPER_TRADING_ENABLED else 'ปิด ⚪'} | ทุน ${PAPER_INITIAL_BALANCE:.0f} | "
         f"{PAPER_LEVERAGE:.0f}x | ไม้ละ {PAPER_POSITION_PCT:.0f}% | Max {PAPER_MAX_OPEN_POSITIONS} ไม้"
     )
-    print(f"• แจ้งเตือน   : Telegram={'เปิด ✅' if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else 'ไม่ได้ตั้งค่า ⚪'} | Discord={'เปิด ✅' if DISCORD_WEBHOOK_URL else 'ไม่ได้ตั้งค่า ⚪'}")
+    print(f"• แจ้งเตือน   : Telegram={tg_bot_txt} | Discord={'เปิด ✅' if DISCORD_WEBHOOK_URL else 'ไม่ได้ตั้งค่า ⚪'}")
     print("==============================================================")
 
     if "--paper-self-test" in sys.argv:
@@ -1533,14 +2295,18 @@ def main():
         return
 
     if "--paper-status" in sys.argv:
-        if os.path.exists(PAPER_STATE_FILE) and paper_trader.state["open_positions"]:
+        if paper_trader.get_state_snapshot()["open_positions"]:
             try:
-                tickers = http_get_json(f"{FAPI_URL}/fapi/v1/ticker/24hr")
-                pmap = {t["symbol"]: float(t.get("lastPrice", 0.0)) for t in tickers}
+                pmap = fetch_all_prices()
                 paper_trader.update_prices(pmap)
             except Exception as e:
                 print(f"⚠️ อัปเดตราคาตลาดล่าสุดไม่ได้ (แสดงข้อมูลล่าสุดที่บันทึกไว้): {e}")
         paper_trader.print_portfolio_summary()
+        if "--send" in sys.argv:
+            telegram_bot.send_dashboard_message(
+                refresh_prices=False,
+                notice="💼 รายงานพอร์ตจำลองตามคำสั่ง",
+            )
         return
 
     if "--test-alert" in sys.argv:
@@ -1565,23 +2331,47 @@ def main():
             ["15m เข้าเขต Oversold ร่วมด้วย (RSI 27.2)", "ตามเทรนด์ใหญ่ 1h (ขาขึ้น)"],
             force=True,
         )
+        telegram_bot.send_dashboard_message(
+            refresh_prices=False,
+            notice="🧪 ทดสอบแสดงผลพอร์ตจำลอง + ปุ่มสั่งการบน Telegram",
+        )
         return
 
     if "--once" in sys.argv:
-        scan_once()
+        with scan_in_progress_lock:
+            scan_once()
+        telegram_bot.send_dashboard_message(
+            refresh_prices=False,
+            notice="📊 สรุปพอร์ตจำลองหลังสแกนรอบล่าสุด",
+        )
         print("\n✅ สแกนครบ 1 รอบเรียบร้อยแล้ว")
         return
 
+    telegram_bot.start()
     print(f"🟢 เริ่มสแกน MTF (5m + 15m + 1h) อัตโนมัติทุกๆ {SCAN_INTERVAL_SECS} วินาที (กด Ctrl+C เพื่อหยุด)...")
+    sent_startup_dashboard = False
     while True:
         try:
-            scan_once()
+            with scan_in_progress_lock:
+                scan_once()
+            if not sent_startup_dashboard:
+                telegram_bot.send_dashboard_message(
+                    refresh_prices=False,
+                    notice="🚀 เริ่มทำงานสแกนตลาด + จำลองการเทรดแล้ว",
+                )
+                sent_startup_dashboard = True
         except KeyboardInterrupt:
             print("\n🛑 หยุดการทำงานเรียบร้อย")
             break
         except Exception as e:
             print(f"⚠️ เกิดข้อผิดพลาดในการสแกน: {e}")
-        time.sleep(SCAN_INTERVAL_SECS)
+
+        try:
+            scan_now_event.wait(timeout=SCAN_INTERVAL_SECS)
+            scan_now_event.clear()
+        except KeyboardInterrupt:
+            print("\n🛑 หยุดการทำงานเรียบร้อย")
+            break
 
 
 if __name__ == "__main__":

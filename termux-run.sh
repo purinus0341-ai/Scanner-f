@@ -74,11 +74,11 @@ if [ -z "$CHOICE" ]; then
     echo ""
     echo "=============================================================="
     echo "🚀 เลือกโหมดการทำงานบนมือถือ:"
-    echo "  1) ⚡ โหมดรันทันที + จำลองเทรดอัตโนมัติ (Mobile Fast Mode - แนะนำ)"
+    echo "  1) ⚡ โหมดรันทันที + จำลองเทรด + บอท Telegram (Mobile Fast Mode - แนะนำ)"
     echo "  2) 🦀 โหมด Rust เต็มรูปแบบ (WebSocket เรียลไทม์ + ดัก Liquidation สด)"
-    echo "  3) 💼 ดูพอร์ตจำลองการเทรดล่าสุด (--paper-status)"
+    echo "  3) 💼 ดูพอร์ตจำลองล่าสุด + ส่งเข้า Telegram (--paper-status --send)"
     echo "  4) 🔄 รีเซ็ตพอร์ตจำลองกลับเป็นทุนเริ่มต้น (--paper-reset)"
-    echo "  5) 🔔 ทดสอบส่งข้อความแจ้งเตือนเข้า Telegram / Discord (--test-alert)"
+    echo "  5) 🔔 ทดสอบส่งข้อความแจ้งเตือน + พอร์ตจำลอง Telegram (--test-alert)"
     echo "  6) 🧪 ทดสอบระบบคำนวณ Paper Trading (--paper-self-test)"
     echo "  7) ⚙️ แก้ไขการตั้งค่า Telegram / Discord / Timeframe / พอร์ตจำลอง"
     echo "=============================================================="
@@ -103,7 +103,7 @@ case "$CHOICE" in
         ./target/release/scanner-f
         ;;
     3|status|--paper-status)
-        python3 mobile_scanner.py --paper-status
+        python3 mobile_scanner.py --paper-status --send
         ;;
     4|reset|--paper-reset)
         python3 mobile_scanner.py --paper-reset

@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -16,19 +16,25 @@ use crate::models::{ScanSignal, SignalCategory};
 pub struct AlertNotifier {
     config: ScannerConfig,
     http_client: Client,
+    long_poll_client: Client,
     cooldowns: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl AlertNotifier {
     pub fn new(config: ScannerConfig) -> Self {
         let http_client = Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(12))
             .build()
             .expect("Failed to create HTTP client for AlertNotifier");
+        let long_poll_client = Client::builder()
+            .timeout(Duration::from_secs(35))
+            .build()
+            .expect("Failed to create long-poll HTTP client for AlertNotifier");
 
         Self {
             config,
             http_client,
+            long_poll_client,
             cooldowns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -141,12 +147,21 @@ impl AlertNotifier {
                 html_escape(symbol)
             ));
 
-            let payload = json!({
+            let mut payload = json!({
                 "chat_id": chat_id,
                 "text": msg_lines.join("\n"),
                 "parse_mode": "HTML",
                 "disable_web_page_preview": true
             });
+            if self.config.paper_telegram_bot_enabled {
+                payload["reply_markup"] = json!({
+                    "inline_keyboard": [[
+                        { "text": "💼 ดูพอร์ต + ปุ่มสั่งการ", "callback_data": "paper:panel" },
+                        { "text": "📜 ประวัติ 10 รายการ", "callback_data": "paper:history_new" }
+                    ]]
+                });
+            }
+
             let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
             if let Err(err) = self.http_client.post(&url).json(&payload).send().await {
                 error!("Failed to send Telegram paper alert: {:#}", err);
@@ -169,6 +184,160 @@ impl AlertNotifier {
                 error!("Failed to send Discord paper alert: {:#}", err);
             }
         }
+    }
+
+    pub async fn send_telegram_html(
+        &self,
+        html_text: &str,
+        inline_keyboard: Option<Value>,
+    ) -> Result<i64> {
+        let token = self
+            .config
+            .telegram_bot_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not configured"))?;
+        let chat_id = self
+            .config
+            .telegram_chat_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("TELEGRAM_CHAT_ID not configured"))?;
+
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "text": html_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true
+        });
+        if let Some(kb) = inline_keyboard {
+            payload["reply_markup"] = json!({ "inline_keyboard": kb });
+        }
+
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+        let resp = self.http_client.post(&url).json(&payload).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Telegram sendMessage failed {}: {}", status, body);
+        }
+        let body: Value = resp.json().await.unwrap_or(json!({}));
+        let msg_id = body
+            .pointer("/result/message_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        Ok(msg_id)
+    }
+
+    pub async fn edit_telegram_html(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        html_text: &str,
+        inline_keyboard: Option<Value>,
+    ) -> Result<()> {
+        let token = self
+            .config
+            .telegram_bot_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not configured"))?;
+
+        let mut payload = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": html_text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true
+        });
+        if let Some(kb) = inline_keyboard {
+            payload["reply_markup"] = json!({ "inline_keyboard": kb });
+        }
+
+        let url = format!("https://api.telegram.org/bot{}/editMessageText", token);
+        let resp = self.http_client.post(&url).json(&payload).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("message is not modified") {
+                return Ok(());
+            }
+            anyhow::bail!("Telegram editMessageText failed {}: {}", status, body);
+        }
+        Ok(())
+    }
+
+    pub async fn answer_telegram_callback(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+        show_alert: bool,
+    ) {
+        let Some(token) = &self.config.telegram_bot_token else {
+            return;
+        };
+        let mut payload = json!({
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert
+        });
+        if let Some(t) = text {
+            payload["text"] = Value::String(t.to_string());
+        }
+        let url = format!("https://api.telegram.org/bot{}/answerCallbackQuery", token);
+        let _ = self.http_client.post(&url).json(&payload).send().await;
+    }
+
+    pub async fn set_telegram_commands(&self) {
+        let Some(token) = &self.config.telegram_bot_token else {
+            return;
+        };
+        let payload = json!({
+            "commands": [
+                { "command": "portfolio", "description": "💼 ดูพอร์ตจำลอง + ปุ่มสั่งการ" },
+                { "command": "history", "description": "📜 ดูประวัติเทรด 10 รายการล่าสุด" },
+                { "command": "scan", "description": "🔍 สแกนตลาด MTF ทันที 1 รอบ" },
+                { "command": "pause", "description": "⏸️ พักการเปิดออเดอร์ใหม่ชั่วคราว" },
+                { "command": "resume", "description": "▶️ เปิดรับออเดอร์จำลองใหม่อีกครั้ง" },
+                { "command": "closeall", "description": "❌ ปิดออเดอร์จำลองทั้งหมดทันที" },
+                { "command": "reset", "description": "🔄 รีเซ็ตพอร์ตจำลองกลับเป็นทุนตั้งต้น" },
+                { "command": "help", "description": "❓ ดูคำสั่งทั้งหมดของบอท" }
+            ]
+        });
+        let url = format!("https://api.telegram.org/bot{}/setMyCommands", token);
+        let _ = self.http_client.post(&url).json(&payload).send().await;
+    }
+
+    pub async fn get_telegram_updates(
+        &self,
+        offset: Option<i64>,
+        timeout_secs: u64,
+    ) -> Result<Vec<Value>> {
+        let token = self
+            .config
+            .telegram_bot_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not configured"))?;
+        let url = format!("https://api.telegram.org/bot{}/getUpdates", token);
+        let mut payload = json!({
+            "timeout": timeout_secs,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        if let Some(off) = offset {
+            payload["offset"] = json!(off);
+        }
+
+        let resp = self.long_poll_client.post(&url).json(&payload).send().await?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(json!({}));
+        if !status.is_success() || !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let desc = body
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            anyhow::bail!("Telegram getUpdates {} ({})", status, desc);
+        }
+        Ok(body
+            .get("result")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn log_to_console(&self, signal: &ScanSignal) {
@@ -353,7 +522,7 @@ pub fn format_compact_usd(amount: f64) -> String {
     }
 }
 
-fn html_escape(input: &str) -> String {
+pub fn html_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
         .replace('<', "&lt;")

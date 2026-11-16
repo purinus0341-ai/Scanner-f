@@ -66,6 +66,8 @@ pub struct ScannerConfig {
     pub paper_min_stars: u8,
     pub paper_taker_fee_pct: f64,
     pub paper_notify_webhooks: bool,
+    pub paper_telegram_bot_enabled: bool,
+    pub paper_telegram_summary_mins: u64,
     pub paper_state_file: String,
     pub paper_trades_csv: String,
 
@@ -127,6 +129,8 @@ impl ScannerConfig {
             paper_min_stars: (env_usize("PAPER_MIN_STARS", 2).clamp(1, 3)) as u8,
             paper_taker_fee_pct: env_f64("PAPER_TAKER_FEE_PCT", 0.05),
             paper_notify_webhooks: env_bool("PAPER_NOTIFY_WEBHOOKS", true),
+            paper_telegram_bot_enabled: env_bool("PAPER_TELEGRAM_BOT_ENABLED", true),
+            paper_telegram_summary_mins: env_u64("PAPER_TELEGRAM_SUMMARY_MINS", 0),
             paper_state_file: env_string("PAPER_STATE_FILE", "paper_state.json"),
             paper_trades_csv: env_string("PAPER_TRADES_CSV", "paper_trades.csv"),
 
