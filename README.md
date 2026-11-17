@@ -137,7 +137,7 @@ curl -sL https://raw.githubusercontent.com/purinus0341-ai/Scanner-f/main/termux-
 ```
 - สคริปต์จะถามค่า `Telegram Bot Token` / `Chat ID` / `Discord Webhook` (หรือกด Enter ข้ามเพื่อดูผลแจ้งเตือนสดบนหน้าจอมือถือได้เลย)
 - เปิด `termux-wake-lock` ให้อัตโนมัติเพื่อให้สแกนต่อได้แม้ปิดหน้าจอมือถือ
-- มีเมนูให้เลือกครบทั้ง **โหมดรันทันที + จำลองเทรด + บอทสั่งการ Telegram (`mobile_scanner.py`)**, **ดูพอร์ตจำลอง + ส่งเข้า Telegram (`--paper-status --send`)**, **รีเซ็ตพอร์ต (`--paper-reset`)**, และ **โหมด Rust เต็มรูปแบบ (`cargo build --release`)**
+- มีเมนูให้เลือกครบทั้ง **โหมดรันทันที + จำลองเทรด + บอทสั่งการ Telegram (`mobile_scanner.py`)**, **ดูพอร์ตจำลอง + ส่งเข้า Telegram (`--paper-status --send`)**, **รีเซ็ตพอร์ต (`--paper-reset`)**, และ **โหมด Rust เต็มรูปแบบ (`cargo build --release -j 1` อัตโนมัติบน Termux เพื่อเลี่ยงบั๊ก Android `Text file busy`)**
 
 ### สำหรับ iPhone / iPad (ผ่านแอป a-Shell หรือ Pythonista) หรือแอป Python บนมือถือ
 ดาวน์โหลดและรันไฟล์ [`mobile_scanner.py`](mobile_scanner.py) ได้ทันทีโดยไม่ต้องติดตั้งไลบรารีเสริม (`pip`):

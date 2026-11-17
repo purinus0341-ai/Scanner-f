@@ -99,7 +99,31 @@ case "$CHOICE" in
             fi
         fi
         echo "🔨 กำลังคอมไพล์ Scanner-f (Rust Release)..."
-        cargo build --release
+        BUILD_ARGS=(build --release)
+        if command -v pkg >/dev/null 2>&1 || [ -n "${TERMUX_VERSION:-}" ]; then
+            # ป้องกันบั๊ก Android/Termux: Text file busy (os error 26) และลดปัญหา RAM เต็มตอนคอมไพล์หลายคอร์
+            export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+            BUILD_ARGS+=(-j "${CARGO_BUILD_JOBS}")
+            echo "ℹ️ ตรวจพบ Termux: ตั้งค่าคอมไพล์แบบทีละงาน (-j ${CARGO_BUILD_JOBS}) เพื่อป้องกัน Text file busy (os error 26)"
+            echo "⏳ รอบแรกอาจใช้เวลา 10–25 นาทีบนมือถือ (หรือกด Ctrl+C แล้วเลือกโหมด 1 เพื่อรันทันทีด้วย Python)"
+        fi
+
+        BUILD_OK=0
+        for ATTEMPT in 1 2 3; do
+            if cargo "${BUILD_ARGS[@]}"; then
+                BUILD_OK=1
+                break
+            fi
+            if [ "$ATTEMPT" -lt 3 ]; then
+                echo "⚠️ คอมไพล์สะดุดชั่วคราว (รอบที่ ${ATTEMPT}/3) — กำลังลองต่ออัตโนมัติใน 3 วินาที..."
+                sleep 3
+            fi
+        done
+
+        if [ "$BUILD_OK" -ne 1 ]; then
+            echo "❌ คอมไพล์ Rust ไม่สำเร็จ — แนะนำเลือกโหมด 1 (Mobile Fast Mode) แทน ซึ่งพร้อมใช้งานทันทีและมีพอร์ต+ปุ่ม Telegram ครบเช่นกันครับ"
+            exit 1
+        fi
         ./target/release/scanner-f
         ;;
     3|status|--paper-status)
