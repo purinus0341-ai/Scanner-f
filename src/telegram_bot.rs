@@ -166,23 +166,80 @@ impl TelegramBotController {
             }
             let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("").trim();
             if text.starts_with('/') {
-                let cmd = text
-                    .split_whitespace()
+                let mut parts = text.splitn(2, char::is_whitespace);
+                let cmd = parts
                     .next()
                     .unwrap_or("")
                     .split('@')
                     .next()
                     .unwrap_or("")
                     .to_lowercase();
-                self.handle_command(&cmd).await;
+                let args = parts.next().unwrap_or("").trim();
+                self.handle_command(&cmd, args).await;
             }
         }
     }
 
-    async fn handle_command(&self, cmd: &str) {
+    async fn handle_command(&self, cmd: &str, args: &str) {
         match cmd {
             "/start" | "/portfolio" | "/status" | "/positions" => {
                 self.send_dashboard_message(true, None).await;
+            }
+            "/settings" | "/config" => {
+                let st = self.paper_trader.get_state_snapshot().await;
+                let (html_text, kb) = render_settings_html(&st, &self.config, None);
+                let _ = self.notifier.send_telegram_html(&html_text, Some(kb)).await;
+            }
+            "/set" => {
+                let (html_text, kb) = if args.is_empty() {
+                    let st = self.paper_trader.get_state_snapshot().await;
+                    render_settings_html(
+                        &st,
+                        &self.config,
+                        Some("💡 พิมพ์ค่าที่ต้องการต่อท้าย /set เช่น /set max 8 lev 15 หรือ /set default"),
+                    )
+                } else {
+                    match parse_set_command_args(args) {
+                        Ok(ParsedSetCommand::ResetToDefault) => {
+                            let st = self.paper_trader.clear_runtime_settings().await;
+                            render_settings_html(
+                                &st,
+                                &self.config,
+                                Some("🔄 คืนค่าเริ่มต้นจากไฟล์ .env เรียบร้อยแล้ว"),
+                            )
+                        }
+                        Ok(ParsedSetCommand::Update {
+                            max_open_positions,
+                            position_pct,
+                            leverage,
+                            min_stars,
+                        }) => {
+                            let st = self
+                                .paper_trader
+                                .update_runtime_settings(
+                                    max_open_positions,
+                                    position_pct,
+                                    leverage,
+                                    min_stars,
+                                )
+                                .await;
+                            let notice = format!(
+                                "✅ บันทึกค่าใหม่แล้ว: Max {} ไม้ | ไม้ละ {}% | {}x | ≥ {}⭐",
+                                st.effective_max_open_positions(&self.config),
+                                fmt_num_clean(st.effective_position_pct(&self.config)),
+                                fmt_num_clean(st.effective_leverage(&self.config)),
+                                st.effective_min_stars(&self.config)
+                            );
+                            render_settings_html(&st, &self.config, Some(&notice))
+                        }
+                        Err(err_msg) => {
+                            let st = self.paper_trader.get_state_snapshot().await;
+                            let notice = format!("⚠️ {}", err_msg);
+                            render_settings_html(&st, &self.config, Some(&notice))
+                        }
+                    }
+                };
+                let _ = self.notifier.send_telegram_html(&html_text, Some(kb)).await;
             }
             "/history" => {
                 let rows = self.paper_trader.recent_csv_events(10);
@@ -227,6 +284,8 @@ impl TelegramBotController {
                 let help_text = concat!(
                     "🤖 <b>คำสั่งควบคุมพอร์ตจำลอง (Scanner-f)</b>\n",
                     "• /portfolio — ดูสรุปพอร์ตจำลอง + ปุ่มสั่งการ\n",
+                    "• /settings — เปิดหน้าตั้งค่า Max ไม้ / ขนาด% / Leverage / ดาว\n",
+                    "• /set — ปรับค่าเอง เช่น <code>/set max 8 lev 15</code> หรือ <code>/set default</code>\n",
                     "• /history — ดูประวัติการเทรด 10 รายการล่าสุด\n",
                     "• /scan — สแกนตลาดและอัปเดตราคาทันที\n",
                     "• /pause — พักการเปิดออเดอร์ใหม่ชั่วคราว\n",
@@ -234,7 +293,12 @@ impl TelegramBotController {
                     "• /closeall — ปิดออเดอร์จำลองทั้งหมดทันที (มีหน้ายืนยัน)\n",
                     "• /reset — รีเซ็ตพอร์ตจำลองกลับเป็นทุนเริ่มต้น (มีหน้ายืนยัน)"
                 );
-                let kb = json!([[{ "text": "💼 เปิดพอร์ตจำลอง + ปุ่มสั่งการ", "callback_data": "paper:panel" }]]);
+                let kb = json!([
+                    [
+                        { "text": "💼 เปิดพอร์ตจำลอง", "callback_data": "paper:panel" },
+                        { "text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings" }
+                    ]
+                ]);
                 let _ = self.notifier.send_telegram_html(help_text, Some(kb)).await;
             }
             _ => {}
@@ -262,6 +326,119 @@ impl TelegramBotController {
                     .notifier
                     .edit_telegram_html(chat_id, msg_id, &html_text, Some(kb))
                     .await;
+            }
+            "paper:settings" => {
+                self.notifier
+                    .answer_telegram_callback(cb_id, Some("⚙️ เปิดหน้าตั้งค่าพอร์ตจำลอง"), false)
+                    .await;
+                let st = self.paper_trader.get_state_snapshot().await;
+                let (html_text, kb) = render_settings_html(&st, &self.config, None);
+                let _ = self
+                    .notifier
+                    .edit_telegram_html(chat_id, msg_id, &html_text, Some(kb))
+                    .await;
+            }
+            "paper:cfg_default" => {
+                let st = self.paper_trader.clear_runtime_settings().await;
+                self.notifier
+                    .answer_telegram_callback(cb_id, Some("🔄 คืนค่าเริ่มต้นจาก .env แล้ว"), false)
+                    .await;
+                let (html_text, kb) = render_settings_html(
+                    &st,
+                    &self.config,
+                    Some("🔄 คืนค่าเริ่มต้นจากไฟล์ .env เรียบร้อยแล้ว"),
+                );
+                let _ = self
+                    .notifier
+                    .edit_telegram_html(chat_id, msg_id, &html_text, Some(kb))
+                    .await;
+            }
+            other if other.starts_with("paper:set:") => {
+                let rest = other.trim_start_matches("paper:set:");
+                let mut parts = rest.splitn(2, ':');
+                let field = parts.next().unwrap_or("");
+                let raw_val = parts.next().unwrap_or("");
+                let mut updated: Option<(PaperPortfolioState, String, String)> = None;
+
+                match field {
+                    "max" => {
+                        if let Ok(v) = raw_val.parse::<usize>() {
+                            let st = self
+                                .paper_trader
+                                .update_runtime_settings(Some(v), None, None, None)
+                                .await;
+                            let eff = st.effective_max_open_positions(&self.config);
+                            updated = Some((
+                                st,
+                                format!("✅ ตั้งจำนวนไม้สูงสุดเป็น {} ไม้แล้ว", eff),
+                                format!("✅ ปรับจำนวนไม้สูงสุดเป็น {} ไม้แล้ว (มีผลทันทีตั้งแต่ไม้ถัดไป)", eff),
+                            ));
+                        }
+                    }
+                    "size" => {
+                        if let Ok(v) = raw_val.parse::<f64>() {
+                            let st = self
+                                .paper_trader
+                                .update_runtime_settings(None, Some(v), None, None)
+                                .await;
+                            let eff = st.effective_position_pct(&self.config);
+                            updated = Some((
+                                st,
+                                format!("✅ ตั้งขนาดไม้เป็น {:.0}% แล้ว", eff),
+                                format!("✅ ปรับขนาดต่อไม้เป็น {:.0}% แล้ว (มีผลทันทีตั้งแต่ไม้ถัดไป)", eff),
+                            ));
+                        }
+                    }
+                    "lev" => {
+                        if let Ok(v) = raw_val.parse::<f64>() {
+                            let st = self
+                                .paper_trader
+                                .update_runtime_settings(None, None, Some(v), None)
+                                .await;
+                            let eff = st.effective_leverage(&self.config);
+                            updated = Some((
+                                st,
+                                format!("✅ ตั้ง Leverage เป็น {:.0}x แล้ว", eff),
+                                format!("✅ ปรับ Leverage เป็น {:.0}x แล้ว (มีผลทันทีตั้งแต่ไม้ถัดไป)", eff),
+                            ));
+                        }
+                    }
+                    "stars" => {
+                        if let Ok(v) = raw_val.parse::<u8>() {
+                            let st = self
+                                .paper_trader
+                                .update_runtime_settings(None, None, None, Some(v))
+                                .await;
+                            let eff = st.effective_min_stars(&self.config);
+                            let label = if eff >= 3 {
+                                "เฉพาะ 3⭐ A+".to_string()
+                            } else {
+                                format!("≥ {}⭐ ขึ้นไป", eff)
+                            };
+                            updated = Some((
+                                st,
+                                format!("✅ ตั้งเกณฑ์เข้าสัญญาณเป็น {} แล้ว", label),
+                                format!("✅ ปรับเกณฑ์รับสัญญาณเป็น {} แล้ว", label),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+
+                if let Some((st, toast, notice)) = updated {
+                    self.notifier
+                        .answer_telegram_callback(cb_id, Some(&toast), false)
+                        .await;
+                    let (html_text, kb) = render_settings_html(&st, &self.config, Some(&notice));
+                    let _ = self
+                        .notifier
+                        .edit_telegram_html(chat_id, msg_id, &html_text, Some(kb))
+                        .await;
+                } else {
+                    self.notifier
+                        .answer_telegram_callback(cb_id, Some("⚠️ ค่าตั้งค่าไม่ถูกต้อง"), true)
+                        .await;
+                }
             }
             "paper:history" => {
                 self.notifier
@@ -305,7 +482,7 @@ impl TelegramBotController {
                 let (html_text, kb) = render_dashboard_html(
                     &st,
                     &self.config,
-                    Some("▶️ เปิดรับออเดอร์จำลองจากสัญญาณ 2-3 ดาวแล้ว"),
+                    Some("▶️ เปิดรับออเดอร์จำลองจากสัญญาณตามเกณฑ์ที่ตั้งไว้แล้ว"),
                 );
                 let _ = self
                     .notifier
@@ -389,7 +566,7 @@ impl TelegramBotController {
                     let (html_text, kb) = render_dashboard_html(
                         &st,
                         &self.config,
-                        Some("🔄 รีเซ็ตพอร์ตและล้างประวัติเรียบร้อยแล้ว"),
+                        Some("🔄 รีเซ็ตพอร์ตและล้างประวัติเรียบร้อยแล้ว (คงค่าตั้งขนาดไม้/Lev ที่ปรับไว้)"),
                     );
                     let _ = self
                         .notifier
@@ -440,6 +617,150 @@ impl TelegramBotController {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedSetCommand {
+    ResetToDefault,
+    Update {
+        max_open_positions: Option<usize>,
+        position_pct: Option<f64>,
+        leverage: Option<f64>,
+        min_stars: Option<u8>,
+    },
+}
+
+pub fn parse_set_command_args(args: &str) -> Result<ParsedSetCommand, String> {
+    let mut tokens: Vec<String> = Vec::new();
+    for raw in args.split_whitespace() {
+        if let Some((k, v)) = raw.split_once('=') {
+            if !k.is_empty() && !v.is_empty() {
+                tokens.push(k.to_string());
+                tokens.push(v.to_string());
+                continue;
+            }
+        } else if let Some((k, v)) = raw.split_once(':') {
+            if !k.is_empty() && !v.is_empty() {
+                tokens.push(k.to_string());
+                tokens.push(v.to_string());
+                continue;
+            }
+        }
+        tokens.push(raw.to_string());
+    }
+
+    if tokens.is_empty() {
+        return Err(
+            "กรุณาระบุค่าที่ต้องการ เช่น /set lev 15 หรือ /set max 8 size 12".to_string(),
+        );
+    }
+
+    if tokens.len() == 1 {
+        let single = tokens[0].trim().to_lowercase();
+        if matches!(single.as_str(), "default" | "reset" | ".env" | "ค่าเริ่มต้น") {
+            return Ok(ParsedSetCommand::ResetToDefault);
+        }
+    }
+
+    let mut max_open_positions: Option<usize> = None;
+    let mut position_pct: Option<f64> = None;
+    let mut leverage: Option<f64> = None;
+    let mut min_stars: Option<u8> = None;
+    let mut updated_any = false;
+
+    let mut i = 0;
+    while i < tokens.len() {
+        let raw_key = tokens[i].trim();
+        let key = raw_key.trim_start_matches('-').to_lowercase();
+        if matches!(key.as_str(), "default" | "reset" | ".env" | "ค่าเริ่มต้น") {
+            return Ok(ParsedSetCommand::ResetToDefault);
+        }
+        if i + 1 >= tokens.len() {
+            return Err(format!(
+                "ยังไม่ได้ใส่ตัวเลขหลัง `{}` (เช่น /set {} 10)",
+                raw_key, raw_key
+            ));
+        }
+        let raw_val = tokens[i + 1].trim();
+        match key.as_str() {
+            "max" | "maxpos" | "max_pos" | "max_positions" | "positions" | "pos" | "limit"
+            | "ไม้" => {
+                let cleaned = raw_val.trim_end_matches("ไม้").trim();
+                let parsed = cleaned.parse::<i64>().map_err(|_| {
+                    format!("จำนวนไม้ `{}` ไม่ถูกต้อง (ต้องเป็นเลข 1–30 เช่น /set max 8)", raw_val)
+                })?;
+                if parsed <= 0 {
+                    return Err("จำนวนไม้สูงสุดต้องมากกว่า 0 (1–30 ไม้)".to_string());
+                }
+                max_open_positions = Some((parsed as usize).clamp(1, 30));
+                updated_any = true;
+            }
+            "size" | "pct" | "margin" | "pos_pct" | "position_pct" | "percent" | "ขนาด" => {
+                let cleaned = raw_val.trim_end_matches('%').trim();
+                let parsed = cleaned.parse::<f64>().map_err(|_| {
+                    format!("ขนาดไม้ `{}` ไม่ถูกต้อง (ต้องเป็นเลข 1–100 เช่น /set size 12)", raw_val)
+                })?;
+                if !parsed.is_finite() || parsed <= 0.0 {
+                    return Err("ขนาดต่อไม้ (%) ต้องมากกว่า 0 (1–100%)".to_string());
+                }
+                position_pct = Some(parsed.clamp(1.0, 100.0));
+                updated_any = true;
+            }
+            "lev" | "leverage" | "x" | "คูณ" => {
+                let cleaned = raw_val.trim_end_matches(['x', 'X']).trim();
+                let parsed = cleaned.parse::<f64>().map_err(|_| {
+                    format!("Leverage `{}` ไม่ถูกต้อง (ต้องเป็นเลข 1–125 เช่น /set lev 15)", raw_val)
+                })?;
+                if !parsed.is_finite() || parsed <= 0.0 {
+                    return Err("Leverage ต้องมากกว่า 0 (1–125x)".to_string());
+                }
+                leverage = Some(parsed.clamp(1.0, 125.0));
+                updated_any = true;
+            }
+            "stars" | "star" | "min_stars" | "minstars" | "ดาว" => {
+                let cleaned = raw_val
+                    .trim_end_matches("ดาว")
+                    .trim_end_matches('⭐')
+                    .trim_end_matches('*')
+                    .trim();
+                let parsed = cleaned.parse::<i64>().map_err(|_| {
+                    format!("ระดับดาว `{}` ไม่ถูกต้อง (เลือก 2 หรือ 3 เช่น /set stars 3)", raw_val)
+                })?;
+                if parsed <= 0 {
+                    return Err("ระดับดาวขั้นต่ำต้องเป็น 1–3 ดาว".to_string());
+                }
+                min_stars = Some((parsed as u8).clamp(1, 3));
+                updated_any = true;
+            }
+            _ => {
+                return Err(format!(
+                    "ไม่รู้จักหัวข้อ `{}` — ใช้ max, size, lev, stars หรือ default",
+                    raw_key
+                ));
+            }
+        }
+        i += 2;
+    }
+
+    if !updated_any {
+        return Err("กรุณาระบุค่าที่ต้องการตั้งอย่างน้อย 1 รายการ".to_string());
+    }
+
+    Ok(ParsedSetCommand::Update {
+        max_open_positions,
+        position_pct,
+        leverage,
+        min_stars,
+    })
+}
+
+fn fmt_num_clean(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-6 {
+        format!("{:.0}", v.round())
+    } else {
+        let s = format!("{:.2}", v);
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
 pub fn render_dashboard_html(
     state: &PaperPortfolioState,
     cfg: &ScannerConfig,
@@ -458,6 +779,16 @@ pub fn render_dashboard_html(
         "🟢 เปิดรับสัญญาณอัตโนมัติ"
     };
 
+    let eff_lev = state.effective_leverage(cfg);
+    let eff_pct = state.effective_position_pct(cfg);
+    let eff_max = state.effective_max_open_positions(cfg);
+    let eff_stars = state.effective_min_stars(cfg);
+    let custom_badge = if state.has_custom_settings() {
+        " [ปรับเอง]"
+    } else {
+        ""
+    };
+
     let mut lines = Vec::new();
     if let Some(note) = notice_line {
         lines.push(format!("ℹ️ <i>{}</i>", html_escape(note)));
@@ -465,6 +796,14 @@ pub fn render_dashboard_html(
     }
     lines.push("💼 <b>พอร์ตจำลองการเทรด (Paper Trading Dashboard)</b>".to_string());
     lines.push(format!("• สถานะเปิดไม้ใหม่: <code>{}</code>", status_badge));
+    lines.push(format!(
+        "• ตั้งค่าไม้: <code>{}x | ไม้ละ {}% | สูงสุด {} ไม้ | ≥ {}⭐{}</code>",
+        fmt_num_clean(eff_lev),
+        fmt_num_clean(eff_pct),
+        eff_max,
+        eff_stars,
+        custom_badge
+    ));
     lines.push(format!(
         "• มูลค่าพอร์ต (Equity): <code>${:.2}</code> (<code>{:+.2} USDT | {:+.2}%</code>)",
         eq, net_usdt, net_pct
@@ -494,13 +833,13 @@ pub fn render_dashboard_html(
     if state.open_positions.is_empty() {
         lines.push(format!(
             "📌 <b>ออเดอร์ที่ถืออยู่ (0/{}):</b> ยังไม่มี (รอสัญญาณ ≥ {} ดาว)",
-            cfg.paper_max_open_positions, cfg.paper_min_stars
+            eff_max, eff_stars
         ));
     } else {
         lines.push(format!(
             "📌 <b>ออเดอร์ที่ถืออยู่ ({}/{} ไม้):</b>",
             state.open_positions.len(),
-            cfg.paper_max_open_positions
+            eff_max
         ));
         for (idx, p) in state.open_positions.iter().enumerate() {
             let side_icon = if p.side == PaperSide::Long {
@@ -563,12 +902,156 @@ pub fn render_dashboard_html(
         ]);
     }
 
-    rows.push(vec![json!({
-        "text": format!("🔄 รีเซ็ตพอร์ต (${:.0})", cfg.paper_initial_balance),
-        "callback_data": "paper:reset_prompt"
-    })]);
+    rows.push(vec![
+        json!({ "text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings" }),
+        json!({
+            "text": format!("🔄 รีเซ็ตพอร์ต (${:.0})", cfg.paper_initial_balance),
+            "callback_data": "paper:reset_prompt"
+        }),
+    ]);
 
     (lines.join("\n"), json!(rows))
+}
+
+pub fn render_settings_html(
+    state: &PaperPortfolioState,
+    cfg: &ScannerConfig,
+    notice_line: Option<&str>,
+) -> (String, Value) {
+    let eff_max = state.effective_max_open_positions(cfg);
+    let eff_pct = state.effective_position_pct(cfg);
+    let eff_lev = state.effective_leverage(cfg);
+    let eff_stars = state.effective_min_stars(cfg);
+
+    let eq = state.total_equity().max(0.0);
+    let est_margin = eq * (eff_pct / 100.0);
+    let est_notional = est_margin * eff_lev;
+    let total_alloc_pct = (eff_max as f64) * eff_pct;
+
+    let source_badge = if state.has_custom_settings() {
+        "🎛️ <code>ปรับแต่งผ่าน Telegram</code> (จดจำถาวรข้ามรีสตาร์ท/รีเซ็ตพอร์ต)"
+    } else {
+        "📄 <code>ใช้ค่าเริ่มต้นจาก .env</code>"
+    };
+    let stars_desc = if eff_stars >= 3 {
+        "เฉพาะ 3⭐ A+ Setup".to_string()
+    } else {
+        format!("≥ {}⭐ ขึ้นไป ({}–3 ดาว)", eff_stars, eff_stars)
+    };
+
+    let mut lines = Vec::new();
+    if let Some(note) = notice_line {
+        lines.push(format!("ℹ️ <i>{}</i>", html_escape(note)));
+        lines.push(String::new());
+    }
+    lines.push("⚙️ <b>ตั้งค่าจำนวนไม้ & ขนาดไม้พอร์ตจำลอง</b>".to_string());
+    lines.push(format!("• แหล่งค่าตั้ง: {}", source_badge));
+    lines.push(format!(
+        "• จำนวนไม้สูงสุด (Max): <code>{} ไม้</code> (กำลังถืออยู่ {}/{})",
+        eff_max,
+        state.open_positions.len(),
+        eff_max
+    ));
+    lines.push(format!(
+        "• ขนาดต่อไม้ (Size): <code>{}%</code> (~<code>${:.2} USDT</code>/ไม้ @ Equity <code>${:.2}</code>)",
+        fmt_num_clean(eff_pct),
+        est_margin,
+        eq
+    ));
+    lines.push(format!(
+        "• ตัวคูณ Leverage: <code>{}x</code> (มูลค่าสัญญา ~<code>${:.2} USDT</code>/ไม้)",
+        fmt_num_clean(eff_lev),
+        est_notional
+    ));
+    lines.push(format!("• เกณฑ์เข้าสัญญาณ: <code>{}</code>", stars_desc));
+    lines.push(format!(
+        "• โควตารวมสูงสุด (Max × Size): <code>{}%</code> | ค่าเริ่มต้น .env: <code>{} ไม้ / {}% / {}x / ≥{}⭐</code>",
+        fmt_num_clean(total_alloc_pct),
+        cfg.paper_max_open_positions,
+        fmt_num_clean(cfg.paper_position_pct),
+        fmt_num_clean(cfg.paper_leverage),
+        cfg.paper_min_stars
+    ));
+
+    if eff_lev >= 20.0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "⚠️ <b>คำเตือน Leverage สูง ({}x):</b> ระบบวาง Stop Loss กว้างสุด ~4.8% จึงเสี่ยงถูก <b>Liquidate ล้าง Margin ไม้นั้น (-100%)</b> ก่อนถึงจุด SL หากราคาสะบัดแรง",
+            fmt_num_clean(eff_lev)
+        ));
+    }
+    if total_alloc_pct > 100.0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "⚠️ <b>คำเตือนสัดส่วน Margin เกิน 100% ({} × {}% = {}%):</b> เงินว่างจะถูกใช้เต็มก่อนครบทุกโควตา ไม้ถัดไปจะรอจนกว่ามีเงินว่างคืนหลังปิดไม้/ชน TP1",
+            eff_max,
+            fmt_num_clean(eff_pct),
+            fmt_num_clean(total_alloc_pct)
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("🎛️ <b>กดปุ่มด้านล่าง (แถว: Max ไม้ → ขนาด% → Leverage → ดาว):</b>".to_string());
+    lines.push(
+        "💡 <b>หรือพิมพ์ปรับค่าละเอียด:</b> <code>/set max 8 lev 15</code> · <code>/set size 12</code> · <code>/set stars 3</code> · <code>/set default</code>"
+            .to_string(),
+    );
+    lines.push("<i>หมายเหตุ: ไม้ที่ถืออยู่แล้วคง Margin/Lev เดิม — ค่าใหม่มีผลตั้งแต่ไม้ถัดไป</i>".to_string());
+
+    let max_row: Vec<Value> = [3usize, 5, 8, 10, 15]
+        .iter()
+        .map(|&m| {
+            let label = if eff_max == m {
+                format!("✅{}ไม้", m)
+            } else {
+                format!("{}ไม้", m)
+            };
+            json!({ "text": label, "callback_data": format!("paper:set:max:{}", m) })
+        })
+        .collect();
+
+    let size_row: Vec<Value> = [5.0f64, 10.0, 15.0, 20.0, 25.0]
+        .iter()
+        .map(|&s| {
+            let label = if (eff_pct - s).abs() < 0.01 {
+                format!("✅{:.0}%", s)
+            } else {
+                format!("{:.0}%", s)
+            };
+            json!({ "text": label, "callback_data": format!("paper:set:size:{:.0}", s) })
+        })
+        .collect();
+
+    let lev_row: Vec<Value> = [3.0f64, 5.0, 10.0, 15.0, 20.0]
+        .iter()
+        .map(|&l| {
+            let label = if (eff_lev - l).abs() < 0.01 {
+                format!("✅{:.0}x", l)
+            } else {
+                format!("{:.0}x", l)
+            };
+            json!({ "text": label, "callback_data": format!("paper:set:lev:{:.0}", l) })
+        })
+        .collect();
+
+    let stars_row = vec![
+        json!({
+            "text": if eff_stars == 2 { "✅ 2⭐ ขึ้นไป" } else { "2⭐ ขึ้นไป" },
+            "callback_data": "paper:set:stars:2"
+        }),
+        json!({
+            "text": if eff_stars == 3 { "✅ เฉพาะ 3⭐ A+" } else { "เฉพาะ 3⭐ A+" },
+            "callback_data": "paper:set:stars:3"
+        }),
+    ];
+
+    let footer_row = vec![
+        json!({ "text": "🔄 คืนค่าเริ่มต้น (.env)", "callback_data": "paper:cfg_default" }),
+        json!({ "text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh" }),
+    ];
+
+    let kb = json!([max_row, size_row, lev_row, stars_row, footer_row]);
+    (lines.join("\n"), kb)
 }
 
 pub fn render_manage_html(state: &PaperPortfolioState) -> (String, Value) {
@@ -676,7 +1159,7 @@ pub fn render_close_all_confirm_html(state: &PaperPortfolioState) -> (String, Va
 
 pub fn render_reset_confirm_html(cfg: &ScannerConfig) -> (String, Value) {
     let text = format!(
-        "⚠️ <b>ยืนยันการรีเซ็ตพอร์ตจำลอง</b>\n\nการรีเซ็ตจะล้างออเดอร์ที่ถืออยู่ทั้งหมด สถิติ Win Rate และไฟล์ประวัติเทรด CSV แล้วตั้งต้นใหม่เป็น <code>${:.2} USDT</code>\nต้องการยืนยันหรือไม่?",
+        "⚠️ <b>ยืนยันการรีเซ็ตพอร์ตจำลอง</b>\n\nการรีเซ็ตจะล้างออเดอร์ที่ถืออยู่ทั้งหมด สถิติ Win Rate และไฟล์ประวัติเทรด CSV แล้วตั้งต้นใหม่เป็น <code>${:.2} USDT</code> <i>(ค่าตั้ง Max ไม้/Size/Lev ที่ปรับไว้จะยังคงเดิม)</i>\nต้องการยืนยันหรือไม่?",
         cfg.paper_initial_balance
     );
     let kb = json!([[
@@ -693,7 +1176,13 @@ mod tests {
 
     #[test]
     fn test_render_dashboard_and_buttons() {
-        let cfg = ScannerConfig::from_env();
+        let mut cfg = ScannerConfig::from_env();
+        cfg.paper_initial_balance = 1000.0;
+        cfg.paper_leverage = 10.0;
+        cfg.paper_position_pct = 10.0;
+        cfg.paper_max_open_positions = 5;
+        cfg.paper_min_stars = 2;
+
         let mut st = PaperPortfolioState::new(1000.0);
         st.open_positions.push(PaperPosition {
             id: 1,
@@ -726,7 +1215,67 @@ mod tests {
         assert!(html.contains("&amp;"));
         assert!(html.contains("&lt;TEST&gt;"));
         assert!(html.contains("กันทุน BE (ถือ 60%)"));
+        assert!(html.contains("10x | ไม้ละ 10% | สูงสุด 5 ไม้"));
         let rows = kb.as_array().unwrap();
         assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3][0]["callback_data"], "paper:settings");
+    }
+
+    #[test]
+    fn test_render_settings_warnings_and_presets() {
+        let mut cfg = ScannerConfig::from_env();
+        cfg.paper_initial_balance = 1000.0;
+        cfg.paper_leverage = 10.0;
+        cfg.paper_position_pct = 10.0;
+        cfg.paper_max_open_positions = 5;
+        cfg.paper_min_stars = 2;
+
+        let mut st = PaperPortfolioState::new(1000.0);
+        st.custom_max_open_positions = Some(8);
+        st.custom_position_pct = Some(20.0);
+        st.custom_leverage = Some(20.0);
+        st.custom_min_stars = Some(3);
+
+        let (html, kb) = render_settings_html(&st, &cfg, Some("อัปเดตสำเร็จ"));
+        assert!(html.contains("อัปเดตสำเร็จ"));
+        assert!(html.contains("ปรับแต่งผ่าน Telegram"));
+        assert!(html.contains("คำเตือน Leverage สูง (20x)"));
+        assert!(html.contains("คำเตือนสัดส่วน Margin เกิน 100% (8 × 20% = 160%)"));
+        let rows = kb.as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0][2]["text"], "✅8ไม้");
+        assert_eq!(rows[1][3]["text"], "✅20%");
+        assert_eq!(rows[2][4]["text"], "✅20x");
+        assert_eq!(rows[3][1]["text"], "✅ เฉพาะ 3⭐ A+");
+        assert_eq!(rows[4][0]["callback_data"], "paper:cfg_default");
+    }
+
+    #[test]
+    fn test_parse_set_command_args() {
+        assert_eq!(
+            parse_set_command_args("default").unwrap(),
+            ParsedSetCommand::ResetToDefault
+        );
+        assert_eq!(
+            parse_set_command_args("max 8 size 12.5% lev 15x stars 3").unwrap(),
+            ParsedSetCommand::Update {
+                max_open_positions: Some(8),
+                position_pct: Some(12.5),
+                leverage: Some(15.0),
+                min_stars: Some(3),
+            }
+        );
+        assert_eq!(
+            parse_set_command_args("max=50 lev=200").unwrap(),
+            ParsedSetCommand::Update {
+                max_open_positions: Some(30),
+                position_pct: None,
+                leverage: Some(125.0),
+                min_stars: None,
+            }
+        );
+        assert!(parse_set_command_args("lev").is_err());
+        assert!(parse_set_command_args("unknown 10").is_err());
+        assert!(parse_set_command_args("max 0").is_err());
     }
 }

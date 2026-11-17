@@ -91,6 +91,14 @@ pub struct PaperPortfolioState {
     pub loss_count: u64,
     #[serde(default)]
     pub paused_opening: bool,
+    #[serde(default)]
+    pub custom_leverage: Option<f64>,
+    #[serde(default)]
+    pub custom_position_pct: Option<f64>,
+    #[serde(default)]
+    pub custom_max_open_positions: Option<usize>,
+    #[serde(default)]
+    pub custom_min_stars: Option<u8>,
     pub open_positions: Vec<PaperPosition>,
 }
 
@@ -119,8 +127,52 @@ impl PaperPortfolioState {
             win_count: 0,
             loss_count: 0,
             paused_opening: false,
+            custom_leverage: None,
+            custom_position_pct: None,
+            custom_max_open_positions: None,
+            custom_min_stars: None,
             open_positions: Vec::new(),
         }
+    }
+
+    pub fn effective_leverage(&self, cfg: &ScannerConfig) -> f64 {
+        self.custom_leverage
+            .unwrap_or(cfg.paper_leverage)
+            .clamp(1.0, 125.0)
+    }
+
+    pub fn effective_position_pct(&self, cfg: &ScannerConfig) -> f64 {
+        self.custom_position_pct
+            .unwrap_or(cfg.paper_position_pct)
+            .clamp(1.0, 100.0)
+    }
+
+    pub fn effective_max_open_positions(&self, cfg: &ScannerConfig) -> usize {
+        self.custom_max_open_positions
+            .unwrap_or(cfg.paper_max_open_positions)
+            .clamp(1, 30)
+    }
+
+    pub fn effective_min_stars(&self, cfg: &ScannerConfig) -> u8 {
+        self.custom_min_stars
+            .unwrap_or(cfg.paper_min_stars)
+            .clamp(1, 3)
+    }
+
+    pub fn has_custom_settings(&self) -> bool {
+        self.custom_leverage.is_some()
+            || self.custom_position_pct.is_some()
+            || self.custom_max_open_positions.is_some()
+            || self.custom_min_stars.is_some()
+    }
+
+    pub fn reset_preserving_settings(&self, initial_balance: f64) -> Self {
+        let mut fresh = Self::new(initial_balance);
+        fresh.custom_leverage = self.custom_leverage;
+        fresh.custom_position_pct = self.custom_position_pct;
+        fresh.custom_max_open_positions = self.custom_max_open_positions;
+        fresh.custom_min_stars = self.custom_min_stars;
+        fresh
     }
 
     pub fn locked_margin(&self) -> f64 {
@@ -201,7 +253,11 @@ impl PaperTrader {
     }
 
     pub fn reset_portfolio(&self) -> Result<PaperPortfolioState> {
-        let fresh = PaperPortfolioState::new(self.config.paper_initial_balance);
+        let current = Self::load_or_init_sync(&self.config);
+        let fresh = current.reset_preserving_settings(self.config.paper_initial_balance);
+        if let Ok(mut guard) = self.state.try_lock() {
+            *guard = fresh.clone();
+        }
         self.save_state_sync(&fresh)?;
         if Path::new(&self.config.paper_trades_csv).exists() {
             fs::remove_file(&self.config.paper_trades_csv)?;
@@ -211,7 +267,7 @@ impl PaperTrader {
 
     pub async fn reset_portfolio_async(&self) -> Result<PaperPortfolioState> {
         let mut st = self.state.lock().await;
-        let fresh = PaperPortfolioState::new(self.config.paper_initial_balance);
+        let fresh = st.reset_preserving_settings(self.config.paper_initial_balance);
         *st = fresh.clone();
         self.save_state_sync(&st)?;
         if Path::new(&self.config.paper_trades_csv).exists() {
@@ -227,6 +283,44 @@ impl PaperTrader {
     pub async fn set_paused(&self, paused: bool) -> PaperPortfolioState {
         let mut st = self.state.lock().await;
         st.paused_opening = paused;
+        let _ = self.save_state_sync(&st);
+        st.clone()
+    }
+
+    pub async fn update_runtime_settings(
+        &self,
+        max_open_positions: Option<usize>,
+        position_pct: Option<f64>,
+        leverage: Option<f64>,
+        min_stars: Option<u8>,
+    ) -> PaperPortfolioState {
+        let mut st = self.state.lock().await;
+        if let Some(m) = max_open_positions {
+            st.custom_max_open_positions = Some(m.clamp(1, 30));
+        }
+        if let Some(p) = position_pct {
+            if p.is_finite() {
+                st.custom_position_pct = Some(p.clamp(1.0, 100.0));
+            }
+        }
+        if let Some(l) = leverage {
+            if l.is_finite() {
+                st.custom_leverage = Some(l.clamp(1.0, 125.0));
+            }
+        }
+        if let Some(s) = min_stars {
+            st.custom_min_stars = Some(s.clamp(1, 3));
+        }
+        let _ = self.save_state_sync(&st);
+        st.clone()
+    }
+
+    pub async fn clear_runtime_settings(&self) -> PaperPortfolioState {
+        let mut st = self.state.lock().await;
+        st.custom_leverage = None;
+        st.custom_position_pct = None;
+        st.custom_max_open_positions = None;
+        st.custom_min_stars = None;
         let _ = self.save_state_sync(&st);
         st.clone()
     }
@@ -338,7 +432,7 @@ impl PaperTrader {
         stars: u8,
         levels: &MtfTradeLevels,
     ) -> Option<u64> {
-        if !self.config.paper_trading_enabled || stars < self.config.paper_min_stars {
+        if !self.config.paper_trading_enabled {
             return None;
         }
         let side = match direction {
@@ -355,26 +449,34 @@ impl PaperTrader {
             if st.paused_opening {
                 return None;
             }
-            if st.open_positions.len() >= self.config.paper_max_open_positions {
+            let eff_min_stars = st.effective_min_stars(&self.config);
+            if stars < eff_min_stars {
+                return None;
+            }
+            let eff_max_pos = st.effective_max_open_positions(&self.config);
+            if st.open_positions.len() >= eff_max_pos {
                 return None;
             }
             if st.open_positions.iter().any(|p| p.symbol == symbol) {
                 return None;
             }
 
+            let eff_pos_pct = st.effective_position_pct(&self.config);
+            let eff_leverage = st.effective_leverage(&self.config);
+
             let equity = st.total_equity();
-            let desired_margin = equity * (self.config.paper_position_pct / 100.0);
+            let desired_margin = equity * (eff_pos_pct / 100.0);
             let fee_rate = self.config.paper_taker_fee_pct / 100.0;
             // Ensure free_balance covers margin + entry_fee
             let max_affordable_margin =
-                st.free_balance / (1.0 + self.config.paper_leverage * fee_rate);
+                st.free_balance / (1.0 + eff_leverage * fee_rate);
             let margin = desired_margin.min(max_affordable_margin);
 
             if margin < 5.0 {
                 return None;
             }
 
-            let notional = margin * self.config.paper_leverage;
+            let notional = margin * eff_leverage;
             let qty = notional / levels.entry_price;
             let entry_fee = notional * fee_rate;
 
@@ -398,7 +500,7 @@ impl PaperTrader {
                 tp1: levels.tp1,
                 tp2: levels.tp2,
                 tp3: levels.tp3,
-                leverage: self.config.paper_leverage,
+                leverage: eff_leverage,
                 initial_margin: margin,
                 remaining_margin: margin,
                 initial_qty: qty,
@@ -438,7 +540,7 @@ impl PaperTrader {
                 format!("⭐ สัญญาณ: {} ({} ดาว | TF: {})", category.as_key(), stars, timeframe),
                 format!(
                     "💰 Margin: ${:.2} ({:.0}x | มูลค่าสัญญา ${:.2})",
-                    margin, self.config.paper_leverage, notional
+                    margin, eff_leverage, notional
                 ),
                 format!("🎯 ราคาเข้า (Entry): ${}", format_price(levels.entry_price)),
                 format!(
@@ -457,7 +559,7 @@ impl PaperTrader {
                     "💼 พอร์ตปัจจุบัน: Equity ${:.2} | ถืออยู่ {}/{} ไม้",
                     eq_after,
                     st.open_positions.len(),
-                    self.config.paper_max_open_positions
+                    eff_max_pos
                 ),
             ];
             let color = if side == PaperSide::Long { 0x00E676 } else { 0xFF5252 };
@@ -1023,11 +1125,24 @@ impl PaperTrader {
             0.0
         };
 
+        let eff_lev = st.effective_leverage(&self.config);
+        let eff_pct = st.effective_position_pct(&self.config);
+        let eff_max = st.effective_max_open_positions(&self.config);
+        let eff_stars = st.effective_min_stars(&self.config);
+
         info!("==============================================================");
         info!("💼 สรุปพอร์ตจำลองการเทรด (Paper Trading Portfolio)");
         info!(
             "• Equity รวม: ${:.2} ({:+.2}%) | ทุนเริ่มต้น: ${:.2}",
             eq, net_pct, st.initial_balance
+        );
+        info!(
+            "• ตั้งค่าไม้: {:.0}x | ไม้ละ {:.0}% | Max {} ไม้ | >= {} ดาว{}",
+            eff_lev,
+            eff_pct,
+            eff_max,
+            eff_stars,
+            if st.has_custom_settings() { " [ปรับผ่าน Telegram]" } else { "" }
         );
         info!(
             "• เงินว่าง (Free): ${:.2} | Margin ที่ถืออยู่: ${:.2} | Unrealized: {:+.2} USDT",
@@ -1045,12 +1160,12 @@ impl PaperTrader {
             st.max_drawdown_pct
         );
         if st.open_positions.is_empty() {
-            info!("• ออเดอร์ที่ถืออยู่: ไม่มี (รอสัญญาณ ⭐⭐/⭐⭐⭐)");
+            info!("• ออเดอร์ที่ถืออยู่: ไม่มี (รอสัญญาณ >= {} ดาว)", eff_stars);
         } else {
             info!(
                 "• ออเดอร์ที่ถืออยู่ ({}/{}):",
                 st.open_positions.len(),
-                self.config.paper_max_open_positions
+                eff_max
             );
             for p in &st.open_positions {
                 let stage = if p.tp2_hit {
@@ -1275,6 +1390,105 @@ mod tests {
         let snap = pt.get_state_snapshot().await;
         assert_eq!(snap.total_closed, 0);
         assert!((snap.free_balance - 1000.0).abs() < 1e-6);
+
+        let _ = fs::remove_file(&cfg.paper_state_file);
+        let _ = fs::remove_file(&cfg.paper_trades_csv);
+    }
+
+    #[tokio::test]
+    async fn test_runtime_settings_override_persistence_and_reset() {
+        let cfg = test_config("settings");
+        let notifier = AlertNotifier::new(cfg.clone());
+        let pt = PaperTrader::new(cfg.clone(), notifier);
+
+        let levels = MtfTradeLevels {
+            entry_price: 100.0,
+            entry_band: 99.5,
+            sl: 98.0,
+            tp1: 102.0,
+            tp2: 104.0,
+            tp3: 106.0,
+            risk_pct: 2.0,
+            tp1_pct: 2.0,
+            tp2_pct: 4.0,
+            tp3_pct: 6.0,
+        };
+
+        // Override max=1, size=20%, lev=20x, min_stars=3
+        let st_custom = pt
+            .update_runtime_settings(Some(1), Some(20.0), Some(20.0), Some(3))
+            .await;
+        assert!(st_custom.has_custom_settings());
+        assert_eq!(st_custom.effective_max_open_positions(&cfg), 1);
+        assert!((st_custom.effective_position_pct(&cfg) - 20.0).abs() < 1e-6);
+        assert!((st_custom.effective_leverage(&cfg) - 20.0).abs() < 1e-6);
+        assert_eq!(st_custom.effective_min_stars(&cfg), 3);
+
+        // 2-star signal blocked when min_stars=3
+        assert!(pt
+            .try_open_position(
+                "BTCUSDT",
+                SignalDirection::Bullish,
+                SignalCategory::PricePump,
+                "5m+15m+1h",
+                2,
+                &levels,
+            )
+            .await
+            .is_none());
+
+        // 3-star signal opens using custom 20% ($200 margin) & 20x leverage
+        let tid1 = pt
+            .try_open_position(
+                "BTCUSDT",
+                SignalDirection::Bullish,
+                SignalCategory::PricePump,
+                "5m+15m+1h",
+                3,
+                &levels,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tid1, 1);
+        {
+            let snap = pt.get_state_snapshot().await;
+            assert!((snap.open_positions[0].initial_margin - 200.0).abs() < 1e-6);
+            assert!((snap.open_positions[0].leverage - 20.0).abs() < 1e-6);
+        }
+
+        // Max=1 should block second symbol
+        assert!(pt
+            .try_open_position(
+                "ETHUSDT",
+                SignalDirection::Bullish,
+                SignalCategory::PricePump,
+                "5m+15m+1h",
+                3,
+                &levels,
+            )
+            .await
+            .is_none());
+
+        // Reset portfolio preserves custom Telegram settings!
+        let st_reset = pt.reset_portfolio_async().await.unwrap();
+        assert_eq!(st_reset.open_positions.len(), 0);
+        assert!(st_reset.has_custom_settings());
+        assert_eq!(st_reset.effective_max_open_positions(&cfg), 1);
+        assert!((st_reset.effective_leverage(&cfg) - 20.0).abs() < 1e-6);
+
+        // Re-loading from disk preserves overrides
+        let pt_reloaded = PaperTrader::new(cfg.clone(), AlertNotifier::new(cfg.clone()));
+        let snap_reloaded = pt_reloaded.get_state_snapshot().await;
+        assert_eq!(snap_reloaded.effective_max_open_positions(&cfg), 1);
+        assert!((snap_reloaded.effective_position_pct(&cfg) - 20.0).abs() < 1e-6);
+
+        // Clearing overrides returns to .env defaults
+        let st_default = pt_reloaded.clear_runtime_settings().await;
+        assert!(!st_default.has_custom_settings());
+        assert_eq!(st_default.effective_max_open_positions(&cfg), 5);
+        assert!((st_default.effective_position_pct(&cfg) - 10.0).abs() < 1e-6);
+        assert!((st_default.effective_leverage(&cfg) - 10.0).abs() < 1e-6);
+        assert_eq!(st_default.effective_min_stars(&cfg), 2);
 
         let _ = fs::remove_file(&cfg.paper_state_file);
         let _ = fs::remove_file(&cfg.paper_trades_csv);

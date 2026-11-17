@@ -634,6 +634,8 @@ def tg_set_commands():
     payload = {
         "commands": [
             {"command": "portfolio", "description": "💼 ดูพอร์ตจำลอง + ปุ่มสั่งการ"},
+            {"command": "settings", "description": "⚙️ ตั้งค่า Max ไม้ / ขนาด% / Leverage / ดาว"},
+            {"command": "set", "description": "🎛️ ตั้งค่าพอร์ตแบบพิมพ์เอง เช่น /set lev 15"},
             {"command": "history", "description": "📜 ดูประวัติเทรด 10 รายการล่าสุด"},
             {"command": "scan", "description": "🔍 สแกนตลาด MTF ทันที 1 รอบ"},
             {"command": "pause", "description": "⏸️ พักการเปิดออเดอร์ใหม่ชั่วคราว"},
@@ -669,6 +671,10 @@ class PaperTrader:
             "win_count": 0,
             "loss_count": 0,
             "paused_opening": False,
+            "custom_leverage": None,
+            "custom_position_pct": None,
+            "custom_max_open_positions": None,
+            "custom_min_stars": None,
             "open_positions": [],
         }
 
@@ -683,6 +689,10 @@ class PaperTrader:
                         if not isinstance(base.get("open_positions"), list):
                             base["open_positions"] = []
                         base.setdefault("paused_opening", False)
+                        base.setdefault("custom_leverage", None)
+                        base.setdefault("custom_position_pct", None)
+                        base.setdefault("custom_max_open_positions", None)
+                        base.setdefault("custom_min_stars", None)
                         return base
             except Exception:
                 pass
@@ -706,9 +716,46 @@ class PaperTrader:
             self.save_state()
             return copy.deepcopy(self.state)
 
+    def update_runtime_settings(self, max_open_positions=None, position_pct=None, leverage=None, min_stars=None):
+        with self._lock:
+            if max_open_positions is not None:
+                self.state["custom_max_open_positions"] = max(1, min(30, int(max_open_positions)))
+            if position_pct is not None:
+                val = float(position_pct)
+                if math.isfinite(val):
+                    self.state["custom_position_pct"] = max(1.0, min(100.0, val))
+            if leverage is not None:
+                val = float(leverage)
+                if math.isfinite(val):
+                    self.state["custom_leverage"] = max(1.0, min(125.0, val))
+            if min_stars is not None:
+                self.state["custom_min_stars"] = max(1, min(3, int(min_stars)))
+            self.save_state()
+            return copy.deepcopy(self.state)
+
+    def clear_runtime_settings(self):
+        with self._lock:
+            self.state["custom_leverage"] = None
+            self.state["custom_position_pct"] = None
+            self.state["custom_max_open_positions"] = None
+            self.state["custom_min_stars"] = None
+            self.save_state()
+            return copy.deepcopy(self.state)
+
     def reset_portfolio(self):
         with self._lock:
-            self.state = self._new_state()
+            custom_keys = {
+                k: self.state.get(k)
+                for k in (
+                    "custom_leverage",
+                    "custom_position_pct",
+                    "custom_max_open_positions",
+                    "custom_min_stars",
+                )
+            }
+            fresh = self._new_state()
+            fresh.update(custom_keys)
+            self.state = fresh
             self.save_state()
             if os.path.exists(self.csv_file):
                 try:
@@ -716,6 +763,42 @@ class PaperTrader:
                 except Exception:
                     pass
             return copy.deepcopy(self.state)
+
+    @staticmethod
+    def state_effective_leverage(st):
+        raw = st.get("custom_leverage")
+        val = float(raw) if isinstance(raw, (int, float)) and math.isfinite(float(raw)) else float(PAPER_LEVERAGE)
+        return max(1.0, min(125.0, val))
+
+    @staticmethod
+    def state_effective_position_pct(st):
+        raw = st.get("custom_position_pct")
+        val = float(raw) if isinstance(raw, (int, float)) and math.isfinite(float(raw)) else float(PAPER_POSITION_PCT)
+        return max(1.0, min(100.0, val))
+
+    @staticmethod
+    def state_effective_max_open_positions(st):
+        raw = st.get("custom_max_open_positions")
+        val = int(raw) if isinstance(raw, (int, float)) else int(PAPER_MAX_OPEN_POSITIONS)
+        return max(1, min(30, val))
+
+    @staticmethod
+    def state_effective_min_stars(st):
+        raw = st.get("custom_min_stars")
+        val = int(raw) if isinstance(raw, (int, float)) else int(PAPER_MIN_STARS)
+        return max(1, min(3, val))
+
+    @staticmethod
+    def state_has_custom_settings(st):
+        return any(
+            st.get(k) is not None
+            for k in (
+                "custom_leverage",
+                "custom_position_pct",
+                "custom_max_open_positions",
+                "custom_min_stars",
+            )
+        )
 
     def recent_csv_events(self, limit=10):
         with self._lock:
@@ -831,7 +914,7 @@ class PaperTrader:
             print(f"⚠️ บันทึกไฟล์ {self.csv_file} ไม่สำเร็จ: {e}")
 
     def try_open_position(self, symbol, direction, category_key, timeframe, stars, plan, notify=True):
-        if not PAPER_TRADING_ENABLED or not plan or stars < PAPER_MIN_STARS:
+        if not PAPER_TRADING_ENABLED or not plan:
             return None
         if direction not in ("BULL", "BEAR"):
             return None
@@ -843,21 +926,28 @@ class PaperTrader:
         with self._lock:
             if self.state.get("paused_opening"):
                 return None
-            if len(self.state["open_positions"]) >= PAPER_MAX_OPEN_POSITIONS:
+            eff_min_stars = self.state_effective_min_stars(self.state)
+            if stars < eff_min_stars:
+                return None
+            eff_max_pos = self.state_effective_max_open_positions(self.state)
+            if len(self.state["open_positions"]) >= eff_max_pos:
                 return None
             if any(p["symbol"] == symbol for p in self.state["open_positions"]):
                 return None
 
+            eff_pos_pct = self.state_effective_position_pct(self.state)
+            eff_leverage = self.state_effective_leverage(self.state)
+
             side = "Long" if direction == "BULL" else "Short"
             equity = self.total_equity()
-            desired_margin = equity * (PAPER_POSITION_PCT / 100.0)
+            desired_margin = equity * (eff_pos_pct / 100.0)
             fee_rate = PAPER_TAKER_FEE_PCT / 100.0
-            max_affordable_margin = self.state["free_balance"] / (1.0 + PAPER_LEVERAGE * fee_rate)
+            max_affordable_margin = self.state["free_balance"] / (1.0 + eff_leverage * fee_rate)
             margin = min(desired_margin, max_affordable_margin)
             if margin < 5.0:
                 return None
 
-            notional = margin * PAPER_LEVERAGE
+            notional = margin * eff_leverage
             qty = notional / entry_price
             entry_fee = notional * fee_rate
 
@@ -881,7 +971,7 @@ class PaperTrader:
                 "tp1": plan["tp1"],
                 "tp2": plan["tp2"],
                 "tp3": plan["tp3"],
-                "leverage": PAPER_LEVERAGE,
+                "leverage": eff_leverage,
                 "initial_margin": margin,
                 "remaining_margin": margin,
                 "initial_qty": qty,
@@ -919,11 +1009,11 @@ class PaperTrader:
             title = f"🧪 [PAPER] เปิดไม้ #{trade_id} {side_emoji} {symbol}"
             lines_th = [
                 f"⭐ สัญญาณ: {category_key} ({stars} ดาว | TF: {timeframe})",
-                f"💰 Margin: ${margin:.2f} ({PAPER_LEVERAGE:.0f}x | มูลค่าสัญญา ${notional:.2f})",
+                f"💰 Margin: ${margin:.2f} ({fmt_num_clean(eff_leverage)}x | มูลค่าสัญญา ${notional:.2f})",
                 f"🎯 ราคาเข้า (Entry): ${fmt_price(entry_price)}",
                 f"📊 เป้าปิด 3 ส่วน: TP1 ${fmt_price(plan['tp1'])} (40%) | TP2 ${fmt_price(plan['tp2'])} (30%) | TP3 ${fmt_price(plan['tp3'])} (30%)",
                 f"🛡️ Stop Loss: ${fmt_price(plan['sl'])} (-{plan['risk_pct']:.2f}%) | ค่าธรรมเนียม: ${entry_fee:.2f}",
-                f"💼 พอร์ตปัจจุบัน: Equity ${eq_after:.2f} | ถืออยู่ {len(self.state['open_positions'])}/{PAPER_MAX_OPEN_POSITIONS} ไม้",
+                f"💼 พอร์ตปัจจุบัน: Equity ${eq_after:.2f} | ถืออยู่ {len(self.state['open_positions'])}/{eff_max_pos} ไม้",
             ]
             pending_notif = (title, symbol, lines_th, 0x00E676 if side == "Long" else 0xFF5252)
 
@@ -1218,15 +1308,23 @@ class PaperTrader:
         eq = self.state_total_equity(st)
         init_bal = st["initial_balance"]
         net_pct = ((eq - init_bal) / init_bal * 100.0) if init_bal > 0 else 0.0
+        eff_lev = self.state_effective_leverage(st)
+        eff_pct = self.state_effective_position_pct(st)
+        eff_max = self.state_effective_max_open_positions(st)
+        eff_stars = self.state_effective_min_stars(st)
+        custom_tag = " [ปรับผ่าน Telegram]" if self.state_has_custom_settings(st) else ""
         pause_txt = " [พักเปิดไม้ใหม่ ⏸️]" if st.get("paused_opening") else ""
         print("\n--------------------------------------------------------------")
         print(f"💼 พอร์ตจำลอง (Paper Trading){pause_txt} | Equity: ${eq:.2f} ({net_pct:+.2f}%) | ทุนตั้งต้น: ${init_bal:.2f}")
+        print(
+            f"   • ตั้งค่าไม้: {fmt_num_clean(eff_lev)}x | ไม้ละ {fmt_num_clean(eff_pct)}% | Max {eff_max} ไม้ | >= {eff_stars} ดาว{custom_tag}"
+        )
         print(f"   • เงินว่าง: ${st['free_balance']:.2f} | Margin ถืออยู่: ${self.state_locked_margin(st):.2f} | uPnL: {self.state_unrealized_pnl(st):+.2f} USDT")
         print(f"   • ปิดไม้แล้ว: {st['total_closed']} | Win Rate: {self.state_win_rate_pct(st):.1f}% ({st['win_count']}W/{st['loss_count']}L) | Realized: {st['realized_pnl']:+.2f} | Max DD: {st['max_drawdown_pct']:.2f}%")
         if not st["open_positions"]:
-            print("   • ออเดอร์ที่ถืออยู่: ไม่มี (รอสัญญาณ ⭐⭐/⭐⭐⭐)")
+            print(f"   • ออเดอร์ที่ถืออยู่: ไม่มี (รอสัญญาณ >= {eff_stars} ดาว)")
         else:
-            print(f"   • ออเดอร์ที่ถืออยู่ ({len(st['open_positions'])}/{PAPER_MAX_OPEN_POSITIONS}):")
+            print(f"   • ออเดอร์ที่ถืออยู่ ({len(st['open_positions'])}/{eff_max}):")
             for p in st["open_positions"]:
                 upnl = self.pos_unrealized_pnl(p)
                 uroe = self.pos_unrealized_roe_pct(p)
@@ -1244,6 +1342,102 @@ scan_now_event = threading.Event()
 scan_in_progress_lock = threading.Lock()
 
 
+def fmt_num_clean(val):
+    if abs(val - round(val)) < 1e-6:
+        return f"{round(val):.0f}"
+    return f"{val:.2f}".rstrip("0").rstrip(".")
+
+
+def parse_set_command_args(args):
+    tokens = []
+    for raw in str(args or "").split():
+        if "=" in raw:
+            k, v = raw.split("=", 1)
+            if k and v:
+                tokens.extend([k, v])
+                continue
+        elif ":" in raw:
+            k, v = raw.split(":", 1)
+            if k and v:
+                tokens.extend([k, v])
+                continue
+        tokens.append(raw)
+
+    if not tokens:
+        return ("error", "กรุณาระบุค่าที่ต้องการ เช่น /set lev 15 หรือ /set max 8 size 12")
+
+    if len(tokens) == 1 and tokens[0].strip().lower() in ("default", "reset", ".env", "ค่าเริ่มต้น"):
+        return ("reset", None)
+
+    updates = {
+        "max_open_positions": None,
+        "position_pct": None,
+        "leverage": None,
+        "min_stars": None,
+    }
+    updated_any = False
+    i = 0
+    while i < len(tokens):
+        raw_key = tokens[i].strip()
+        key = raw_key.lstrip("-").lower()
+        if key in ("default", "reset", ".env", "ค่าเริ่มต้น"):
+            return ("reset", None)
+        if i + 1 >= len(tokens):
+            return ("error", f"ยังไม่ได้ใส่ตัวเลขหลัง `{raw_key}` (เช่น /set {raw_key} 10)")
+        raw_val = tokens[i + 1].strip()
+
+        if key in ("max", "maxpos", "max_pos", "max_positions", "positions", "pos", "limit", "ไม้"):
+            cleaned = raw_val.removesuffix("ไม้").strip() if hasattr(raw_val, "removesuffix") else (raw_val[:-3].strip() if raw_val.endswith("ไม้") else raw_val)
+            try:
+                parsed = int(cleaned)
+            except Exception:
+                return ("error", f"จำนวนไม้ `{raw_val}` ไม่ถูกต้อง (ต้องเป็นเลข 1–30 เช่น /set max 8)")
+            if parsed <= 0:
+                return ("error", "จำนวนไม้สูงสุดต้องมากกว่า 0 (1–30 ไม้)")
+            updates["max_open_positions"] = max(1, min(30, parsed))
+            updated_any = True
+        elif key in ("size", "pct", "margin", "pos_pct", "position_pct", "percent", "ขนาด"):
+            cleaned = raw_val.rstrip("%").strip()
+            try:
+                parsed = float(cleaned)
+            except Exception:
+                return ("error", f"ขนาดไม้ `{raw_val}` ไม่ถูกต้อง (ต้องเป็นเลข 1–100 เช่น /set size 12)")
+            if not math.isfinite(parsed) or parsed <= 0:
+                return ("error", "ขนาดต่อไม้ (%) ต้องมากกว่า 0 (1–100%)")
+            updates["position_pct"] = max(1.0, min(100.0, parsed))
+            updated_any = True
+        elif key in ("lev", "leverage", "x", "คูณ"):
+            cleaned = raw_val.rstrip("xX").strip()
+            try:
+                parsed = float(cleaned)
+            except Exception:
+                return ("error", f"Leverage `{raw_val}` ไม่ถูกต้อง (ต้องเป็นเลข 1–125 เช่น /set lev 15)")
+            if not math.isfinite(parsed) or parsed <= 0:
+                return ("error", "Leverage ต้องมากกว่า 0 (1–125x)")
+            updates["leverage"] = max(1.0, min(125.0, parsed))
+            updated_any = True
+        elif key in ("stars", "star", "min_stars", "minstars", "ดาว"):
+            cleaned = raw_val.rstrip("*⭐")
+            if cleaned.endswith("ดาว"):
+                cleaned = cleaned[:-3]
+            cleaned = cleaned.strip()
+            try:
+                parsed = int(cleaned)
+            except Exception:
+                return ("error", f"ระดับดาว `{raw_val}` ไม่ถูกต้อง (เลือก 2 หรือ 3 เช่น /set stars 3)")
+            if parsed <= 0:
+                return ("error", "ระดับดาวขั้นต่ำต้องเป็น 1–3 ดาว")
+            updates["min_stars"] = max(1, min(3, parsed))
+            updated_any = True
+        else:
+            return ("error", f"ไม่รู้จักหัวข้อ `{raw_key}` — ใช้ max, size, lev, stars หรือ default")
+        i += 2
+
+    if not updated_any:
+        return ("error", "กรุณาระบุค่าที่ต้องการตั้งอย่างน้อย 1 รายการ")
+    return ("update", updates)
+
+
 def render_dashboard_html(st, notice_line=None):
     eq = PaperTrader.state_total_equity(st)
     init_bal = st["initial_balance"]
@@ -1251,12 +1445,21 @@ def render_dashboard_html(st, notice_line=None):
     net_pct = (net_usdt / init_bal * 100.0) if init_bal > 0 else 0.0
     status_badge = "⏸️ พักเปิดไม้ใหม่ชั่วคราว" if st.get("paused_opening") else "🟢 เปิดรับสัญญาณอัตโนมัติ"
 
+    eff_lev = PaperTrader.state_effective_leverage(st)
+    eff_pct = PaperTrader.state_effective_position_pct(st)
+    eff_max = PaperTrader.state_effective_max_open_positions(st)
+    eff_stars = PaperTrader.state_effective_min_stars(st)
+    custom_badge = " [ปรับเอง]" if PaperTrader.state_has_custom_settings(st) else ""
+
     lines = []
     if notice_line:
         lines.append(f"ℹ️ <i>{html.escape(str(notice_line))}</i>")
         lines.append("")
     lines.append("💼 <b>พอร์ตจำลองการเทรด (Paper Trading Dashboard)</b>")
     lines.append(f"• สถานะเปิดไม้ใหม่: <code>{status_badge}</code>")
+    lines.append(
+        f"• ตั้งค่าไม้: <code>{fmt_num_clean(eff_lev)}x | ไม้ละ {fmt_num_clean(eff_pct)}% | สูงสุด {eff_max} ไม้ | ≥ {eff_stars}⭐{custom_badge}</code>"
+    )
     lines.append(f"• มูลค่าพอร์ต (Equity): <code>${eq:.2f}</code> (<code>{net_usdt:+.2f} USDT | {net_pct:+.2f}%</code>)")
     lines.append(
         f"• ทุนตั้งต้น: <code>${init_bal:.2f}</code> | เงินว่าง: <code>${st['free_balance']:.2f}</code> | Margin ถืออยู่: <code>${PaperTrader.state_locked_margin(st):.2f}</code>"
@@ -1271,9 +1474,9 @@ def render_dashboard_html(st, notice_line=None):
 
     open_pos = st.get("open_positions", [])
     if not open_pos:
-        lines.append(f"📌 <b>ออเดอร์ที่ถืออยู่ (0/{PAPER_MAX_OPEN_POSITIONS}):</b> ยังไม่มี (รอสัญญาณ ≥ {PAPER_MIN_STARS} ดาว)")
+        lines.append(f"📌 <b>ออเดอร์ที่ถืออยู่ (0/{eff_max}):</b> ยังไม่มี (รอสัญญาณ ≥ {eff_stars} ดาว)")
     else:
-        lines.append(f"📌 <b>ออเดอร์ที่ถืออยู่ ({len(open_pos)}/{PAPER_MAX_OPEN_POSITIONS} ไม้):</b>")
+        lines.append(f"📌 <b>ออเดอร์ที่ถืออยู่ ({len(open_pos)}/{eff_max} ไม้):</b>")
         for idx, p in enumerate(open_pos, start=1):
             side_icon = "🟢 LONG" if p["side"] == "Long" else "🔴 SHORT"
             stage = "TP1+TP2 (ถือ 30%)" if p["tp2_hit"] else ("กันทุน BE (ถือ 60%)" if p["tp1_hit"] else "รอ TP1 (ถือ 100%)")
@@ -1310,8 +1513,94 @@ def render_dashboard_html(st, notice_line=None):
                 {"text": "❌ ปิดทุกไม้ทันที", "callback_data": "paper:close_all_prompt"},
             ]
         )
-    rows.append([{"text": f"🔄 รีเซ็ตพอร์ต (${PAPER_INITIAL_BALANCE:.0f})", "callback_data": "paper:reset_prompt"}])
+    rows.append(
+        [
+            {"text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings"},
+            {"text": f"🔄 รีเซ็ตพอร์ต (${PAPER_INITIAL_BALANCE:.0f})", "callback_data": "paper:reset_prompt"},
+        ]
+    )
     return "\n".join(lines), rows
+
+
+def render_settings_html(st, notice_line=None):
+    eff_max = PaperTrader.state_effective_max_open_positions(st)
+    eff_pct = PaperTrader.state_effective_position_pct(st)
+    eff_lev = PaperTrader.state_effective_leverage(st)
+    eff_stars = PaperTrader.state_effective_min_stars(st)
+
+    eq = max(0.0, PaperTrader.state_total_equity(st))
+    est_margin = eq * (eff_pct / 100.0)
+    est_notional = est_margin * eff_lev
+    total_alloc_pct = eff_max * eff_pct
+    open_cnt = len(st.get("open_positions", []))
+
+    source_badge = (
+        "🎛️ <code>ปรับแต่งผ่าน Telegram</code> (จดจำถาวรข้ามรีสตาร์ท/รีเซ็ตพอร์ต)"
+        if PaperTrader.state_has_custom_settings(st)
+        else "📄 <code>ใช้ค่าเริ่มต้นจาก .env</code>"
+    )
+    stars_desc = "เฉพาะ 3⭐ A+ Setup" if eff_stars >= 3 else f"≥ {eff_stars}⭐ ขึ้นไป ({eff_stars}–3 ดาว)"
+
+    lines = []
+    if notice_line:
+        lines.append(f"ℹ️ <i>{html.escape(str(notice_line))}</i>")
+        lines.append("")
+    lines.append("⚙️ <b>ตั้งค่าจำนวนไม้ & ขนาดไม้พอร์ตจำลอง</b>")
+    lines.append(f"• แหล่งค่าตั้ง: {source_badge}")
+    lines.append(f"• จำนวนไม้สูงสุด (Max): <code>{eff_max} ไม้</code> (กำลังถืออยู่ {open_cnt}/{eff_max})")
+    lines.append(
+        f"• ขนาดต่อไม้ (Size): <code>{fmt_num_clean(eff_pct)}%</code> (~<code>${est_margin:.2f} USDT</code>/ไม้ @ Equity <code>${eq:.2f}</code>)"
+    )
+    lines.append(
+        f"• ตัวคูณ Leverage: <code>{fmt_num_clean(eff_lev)}x</code> (มูลค่าสัญญา ~<code>${est_notional:.2f} USDT</code>/ไม้)"
+    )
+    lines.append(f"• เกณฑ์เข้าสัญญาณ: <code>{stars_desc}</code>")
+    lines.append(
+        f"• โควตารวมสูงสุด (Max × Size): <code>{fmt_num_clean(total_alloc_pct)}%</code> | "
+        f"ค่าเริ่มต้น .env: <code>{PAPER_MAX_OPEN_POSITIONS} ไม้ / {fmt_num_clean(PAPER_POSITION_PCT)}% / {fmt_num_clean(PAPER_LEVERAGE)}x / ≥{PAPER_MIN_STARS}⭐</code>"
+    )
+
+    if eff_lev >= 20.0:
+        lines.append("")
+        lines.append(
+            f"⚠️ <b>คำเตือน Leverage สูง ({fmt_num_clean(eff_lev)}x):</b> ระบบวาง Stop Loss กว้างสุด ~4.8% "
+            "จึงเสี่ยงถูก <b>Liquidate ล้าง Margin ไม้นั้น (-100%)</b> ก่อนถึงจุด SL หากราคาสะบัดแรง"
+        )
+    if total_alloc_pct > 100.0:
+        lines.append("")
+        lines.append(
+            f"⚠️ <b>คำเตือนสัดส่วน Margin เกิน 100% ({eff_max} × {fmt_num_clean(eff_pct)}% = {fmt_num_clean(total_alloc_pct)}%):</b> "
+            "เงินว่างจะถูกใช้เต็มก่อนครบทุกโควตา ไม้ถัดไปจะรอจนกว่ามีเงินว่างคืนหลังปิดไม้/ชน TP1"
+        )
+
+    lines.append("")
+    lines.append("🎛️ <b>กดปุ่มด้านล่าง (แถว: Max ไม้ → ขนาด% → Leverage → ดาว):</b>")
+    lines.append(
+        "💡 <b>หรือพิมพ์ปรับค่าละเอียด:</b> <code>/set max 8 lev 15</code> · <code>/set size 12</code> · <code>/set stars 3</code> · <code>/set default</code>"
+    )
+    lines.append("<i>หมายเหตุ: ไม้ที่ถืออยู่แล้วคง Margin/Lev เดิม — ค่าใหม่มีผลตั้งแต่ไม้ถัดไป</i>")
+
+    max_row = [
+        {"text": (f"✅{m}ไม้" if eff_max == m else f"{m}ไม้"), "callback_data": f"paper:set:max:{m}"}
+        for m in (3, 5, 8, 10, 15)
+    ]
+    size_row = [
+        {"text": (f"✅{s}%" if abs(eff_pct - s) < 0.01 else f"{s}%"), "callback_data": f"paper:set:size:{s}"}
+        for s in (5, 10, 15, 20, 25)
+    ]
+    lev_row = [
+        {"text": (f"✅{lv}x" if abs(eff_lev - lv) < 0.01 else f"{lv}x"), "callback_data": f"paper:set:lev:{lv}"}
+        for lv in (3, 5, 10, 15, 20)
+    ]
+    stars_row = [
+        {"text": ("✅ 2⭐ ขึ้นไป" if eff_stars == 2 else "2⭐ ขึ้นไป"), "callback_data": "paper:set:stars:2"},
+        {"text": ("✅ เฉพาะ 3⭐ A+" if eff_stars == 3 else "เฉพาะ 3⭐ A+"), "callback_data": "paper:set:stars:3"},
+    ]
+    footer_row = [
+        {"text": "🔄 คืนค่าเริ่มต้น (.env)", "callback_data": "paper:cfg_default"},
+        {"text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh"},
+    ]
+    return "\n".join(lines), [max_row, size_row, lev_row, stars_row, footer_row]
 
 
 def render_manage_html(st):
@@ -1395,7 +1684,8 @@ def render_close_all_confirm_html(st):
 def render_reset_confirm_html():
     text = (
         "⚠️ <b>ยืนยันการรีเซ็ตพอร์ตจำลอง</b>\n\n"
-        f"การรีเซ็ตจะล้างออเดอร์ที่ถืออยู่ทั้งหมด สถิติ Win Rate และไฟล์ประวัติเทรด CSV แล้วตั้งต้นใหม่เป็น <code>${PAPER_INITIAL_BALANCE:.2f} USDT</code>\n"
+        f"การรีเซ็ตจะล้างออเดอร์ที่ถืออยู่ทั้งหมด สถิติ Win Rate และไฟล์ประวัติเทรด CSV แล้วตั้งต้นใหม่เป็น <code>${PAPER_INITIAL_BALANCE:.2f} USDT</code> "
+        "<i>(ค่าตั้ง Max ไม้/Size/Lev ที่ปรับไว้จะยังคงเดิม)</i>\n"
         "ต้องการยืนยันหรือไม่?"
     )
     kb = [
@@ -1509,12 +1799,49 @@ class TelegramPaperBotController:
                 return
             text = (msg.get("text") or "").strip()
             if text.startswith("/"):
-                cmd = text.split()[0].split("@")[0].lower()
-                self._handle_command(cmd)
+                parts = text.split(None, 1)
+                cmd = parts[0].split("@")[0].lower()
+                args = parts[1].strip() if len(parts) > 1 else ""
+                self._handle_command(cmd, args)
 
-    def _handle_command(self, cmd):
+    def _handle_command(self, cmd, args=""):
         if cmd in ("/start", "/portfolio", "/status", "/positions"):
             self.send_dashboard_message(refresh_prices=True)
+        elif cmd in ("/settings", "/config"):
+            st = self.trader.get_state_snapshot()
+            html_text, kb = render_settings_html(st)
+            try:
+                tg_send_html(html_text, kb)
+            except Exception:
+                pass
+        elif cmd == "/set":
+            if not args:
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_settings_html(
+                    st,
+                    notice_line="💡 พิมพ์ค่าที่ต้องการต่อท้าย /set เช่น /set max 8 lev 15 หรือ /set default",
+                )
+            else:
+                mode, payload = parse_set_command_args(args)
+                if mode == "reset":
+                    st = self.trader.clear_runtime_settings()
+                    html_text, kb = render_settings_html(st, notice_line="🔄 คืนค่าเริ่มต้นจากไฟล์ .env เรียบร้อยแล้ว")
+                elif mode == "update":
+                    st = self.trader.update_runtime_settings(**payload)
+                    notice = (
+                        f"✅ บันทึกค่าใหม่แล้ว: Max {PaperTrader.state_effective_max_open_positions(st)} ไม้ | "
+                        f"ไม้ละ {fmt_num_clean(PaperTrader.state_effective_position_pct(st))}% | "
+                        f"{fmt_num_clean(PaperTrader.state_effective_leverage(st))}x | "
+                        f"≥ {PaperTrader.state_effective_min_stars(st)}⭐"
+                    )
+                    html_text, kb = render_settings_html(st, notice_line=notice)
+                else:
+                    st = self.trader.get_state_snapshot()
+                    html_text, kb = render_settings_html(st, notice_line=f"⚠️ {payload}")
+            try:
+                tg_send_html(html_text, kb)
+            except Exception:
+                pass
         elif cmd == "/history":
             rows = self.trader.recent_csv_events(10)
             html_text, kb = render_history_html(rows)
@@ -1565,6 +1892,8 @@ class TelegramPaperBotController:
             help_text = (
                 "🤖 <b>คำสั่งควบคุมพอร์ตจำลอง (Scanner-f)</b>\n"
                 "• /portfolio — ดูสรุปพอร์ตจำลอง + ปุ่มสั่งการ\n"
+                "• /settings — เปิดหน้าตั้งค่า Max ไม้ / ขนาด% / Leverage / ดาว\n"
+                "• /set — ปรับค่าเอง เช่น <code>/set max 8 lev 15</code> หรือ <code>/set default</code>\n"
                 "• /history — ดูประวัติการเทรด 10 รายการล่าสุด\n"
                 "• /scan — สแกนตลาด MTF ทันที 1 รอบ\n"
                 "• /pause — พักการเปิดออเดอร์ใหม่ชั่วคราว\n"
@@ -1572,8 +1901,14 @@ class TelegramPaperBotController:
                 "• /closeall — ปิดออเดอร์จำลองทั้งหมดทันที (มีหน้ายืนยัน)\n"
                 "• /reset — รีเซ็ตพอร์ตจำลองกลับเป็นทุนเริ่มต้น (มีหน้ายืนยัน)"
             )
+            kb = [
+                [
+                    {"text": "💼 เปิดพอร์ตจำลอง", "callback_data": "paper:panel"},
+                    {"text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings"},
+                ]
+            ]
             try:
-                tg_send_html(help_text, [[{"text": "💼 เปิดพอร์ตจำลอง + ปุ่มสั่งการ", "callback_data": "paper:panel"}]])
+                tg_send_html(help_text, kb)
             except Exception:
                 pass
 
@@ -1592,6 +1927,53 @@ class TelegramPaperBotController:
                 st = self.trader.get_state_snapshot()
                 html_text, kb = render_dashboard_html(st)
                 tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:settings":
+                tg_answer_callback(cb_id, "⚙️ เปิดหน้าตั้งค่าพอร์ตจำลอง")
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_settings_html(st)
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:cfg_default":
+                st = self.trader.clear_runtime_settings()
+                tg_answer_callback(cb_id, "🔄 คืนค่าเริ่มต้นจาก .env แล้ว")
+                html_text, kb = render_settings_html(st, notice_line="🔄 คืนค่าเริ่มต้นจากไฟล์ .env เรียบร้อยแล้ว")
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data.startswith("paper:set:"):
+                parts = data.split(":", 3)
+                field = parts[2] if len(parts) > 2 else ""
+                raw_val = parts[3] if len(parts) > 3 else ""
+                toast = None
+                notice = None
+                st = None
+                try:
+                    if field == "max":
+                        st = self.trader.update_runtime_settings(max_open_positions=int(raw_val))
+                        eff = PaperTrader.state_effective_max_open_positions(st)
+                        toast = f"✅ ตั้งจำนวนไม้สูงสุดเป็น {eff} ไม้แล้ว"
+                        notice = f"✅ ปรับจำนวนไม้สูงสุดเป็น {eff} ไม้แล้ว (มีผลทันทีตั้งแต่ไม้ถัดไป)"
+                    elif field == "size":
+                        st = self.trader.update_runtime_settings(position_pct=float(raw_val))
+                        eff = PaperTrader.state_effective_position_pct(st)
+                        toast = f"✅ ตั้งขนาดไม้เป็น {fmt_num_clean(eff)}% แล้ว"
+                        notice = f"✅ ปรับขนาดต่อไม้เป็น {fmt_num_clean(eff)}% แล้ว (มีผลทันทีตั้งแต่ไม้ถัดไป)"
+                    elif field == "lev":
+                        st = self.trader.update_runtime_settings(leverage=float(raw_val))
+                        eff = PaperTrader.state_effective_leverage(st)
+                        toast = f"✅ ตั้ง Leverage เป็น {fmt_num_clean(eff)}x แล้ว"
+                        notice = f"✅ ปรับ Leverage เป็น {fmt_num_clean(eff)}x แล้ว (มีผลทันทีตั้งแต่ไม้ถัดไป)"
+                    elif field == "stars":
+                        st = self.trader.update_runtime_settings(min_stars=int(raw_val))
+                        eff = PaperTrader.state_effective_min_stars(st)
+                        lbl = "เฉพาะ 3⭐ A+" if eff >= 3 else f"≥ {eff}⭐ ขึ้นไป"
+                        toast = f"✅ ตั้งเกณฑ์เข้าสัญญาณเป็น {lbl} แล้ว"
+                        notice = f"✅ ปรับเกณฑ์รับสัญญาณเป็น {lbl} แล้ว"
+                except Exception:
+                    st = None
+                if st is not None:
+                    tg_answer_callback(cb_id, toast)
+                    html_text, kb = render_settings_html(st, notice_line=notice)
+                    tg_edit_html(chat_id, msg_id, html_text, kb)
+                else:
+                    tg_answer_callback(cb_id, "⚠️ ค่าตั้งค่าไม่ถูกต้อง", show_alert=True)
             elif data == "paper:history":
                 tg_answer_callback(cb_id, "📜 โหลดประวัติเทรดล่าสุดแล้ว")
                 rows = self.trader.recent_csv_events(10)
@@ -1610,7 +1992,7 @@ class TelegramPaperBotController:
             elif data == "paper:resume":
                 tg_answer_callback(cb_id, "▶️ เปิดรับออเดอร์ใหม่แล้ว")
                 st = self.trader.set_paused(False)
-                html_text, kb = render_dashboard_html(st, notice_line="▶️ เปิดรับออเดอร์จำลองจากสัญญาณ 2-3 ดาวแล้ว")
+                html_text, kb = render_dashboard_html(st, notice_line="▶️ เปิดรับออเดอร์จำลองจากสัญญาณตามเกณฑ์ที่ตั้งไว้แล้ว")
                 tg_edit_html(chat_id, msg_id, html_text, kb)
             elif data == "paper:scan":
                 if scan_in_progress_lock.locked():
@@ -1660,7 +2042,7 @@ class TelegramPaperBotController:
             elif data == "paper:reset_confirm":
                 st = self.trader.reset_portfolio()
                 tg_answer_callback(cb_id, "🔄 รีเซ็ตพอร์ตจำลองกลับเป็นทุนเริ่มต้นเรียบร้อย!")
-                html_text, kb = render_dashboard_html(st, notice_line="🔄 รีเซ็ตพอร์ตและล้างประวัติเรียบร้อยแล้ว")
+                html_text, kb = render_dashboard_html(st, notice_line="🔄 รีเซ็ตพอร์ตและล้างประวัติเรียบร้อยแล้ว (คงค่าตั้งขนาดไม้/Lev ที่ปรับไว้)")
                 tg_edit_html(chat_id, msg_id, html_text, kb)
             elif data.startswith("paper:close:"):
                 try:
@@ -2265,7 +2647,67 @@ def run_paper_self_test():
         assert "MANUAL_CLOSE" in hist_html
         assert len(hist_kb) == 1
 
-        print("✅ ทดสอบตรรกะระบบจำลองการเทรด + Telegram Dashboard Self-Test (4 กรณี) ผ่าน 100%!")
+        # 5) Runtime settings overrides, persistence, reset preservation, /set parser & warnings
+        st_cfg = pt.update_runtime_settings(max_open_positions=1, position_pct=20.0, leverage=20.0, min_stars=3)
+        assert PaperTrader.state_has_custom_settings(st_cfg) is True
+        assert PaperTrader.state_effective_max_open_positions(st_cfg) == 1
+        assert abs(PaperTrader.state_effective_position_pct(st_cfg) - 20.0) < 1e-6
+        assert abs(PaperTrader.state_effective_leverage(st_cfg) - 20.0) < 1e-6
+        assert PaperTrader.state_effective_min_stars(st_cfg) == 3
+
+        # 2-star signal blocked when min_stars=3
+        assert pt.try_open_position("DOGEUSDT", "BULL", "RSI_OS", "5m+15m+1h", 2, sol_plan, notify=False) is None
+        # 3-star opens with 20% equity (~20% margin) & 20x leverage
+        tid5 = pt.try_open_position("AVAXUSDT", "BULL", "RSI_OS", "5m+15m+1h", 3, sol_plan, notify=False)
+        assert tid5 == 5
+        open_now = pt.get_state_snapshot()["open_positions"]
+        assert len(open_now) == 1
+        assert abs(open_now[0]["leverage"] - 20.0) < 1e-6
+        # Max=1 blocks second symbol
+        assert pt.try_open_position("LINKUSDT", "BULL", "RSI_OS", "5m+15m+1h", 3, sol_plan, notify=False) is None
+
+        # High risk warnings check in Settings HTML (Lev 20x & max=8*size=20% = 160%)
+        st_warn = pt.update_runtime_settings(max_open_positions=8)
+        set_html, set_kb = render_settings_html(st_warn, notice_line="บันทึกทดสอบ")
+        assert "คำเตือน Leverage สูง (20x)" in set_html
+        assert "คำเตือนสัดส่วน Margin เกิน 100% (8 × 20% = 160%)" in set_html
+        assert set_kb[0][2]["text"] == "✅8ไม้"
+        assert set_kb[1][3]["text"] == "✅20%"
+        assert set_kb[2][4]["text"] == "✅20x"
+        assert set_kb[3][1]["text"] == "✅ เฉพาะ 3⭐ A+"
+
+        # Reset portfolio preserves custom Telegram settings!
+        st_reset = pt.reset_portfolio()
+        assert len(st_reset["open_positions"]) == 0
+        assert PaperTrader.state_has_custom_settings(st_reset) is True
+        assert PaperTrader.state_effective_max_open_positions(st_reset) == 8
+
+        # Reload from disk preserves overrides
+        pt_reloaded = PaperTrader(
+            state_file=os.path.join(tmpdir, "state.json"),
+            csv_file=os.path.join(tmpdir, "trades.csv"),
+        )
+        snap_reloaded = pt_reloaded.get_state_snapshot()
+        assert PaperTrader.state_effective_max_open_positions(snap_reloaded) == 8
+        assert abs(PaperTrader.state_effective_leverage(snap_reloaded) - 20.0) < 1e-6
+
+        # /set command parser checks
+        assert parse_set_command_args("default") == ("reset", None)
+        mode, parsed_vals = parse_set_command_args("max 10 size 12.5% lev=15x stars 2")
+        assert mode == "update"
+        assert parsed_vals["max_open_positions"] == 10
+        assert abs(parsed_vals["position_pct"] - 12.5) < 1e-6
+        assert abs(parsed_vals["leverage"] - 15.0) < 1e-6
+        assert parsed_vals["min_stars"] == 2
+        mode_err, _ = parse_set_command_args("lev")
+        assert mode_err == "error"
+
+        # Revert to .env defaults
+        st_default = pt_reloaded.clear_runtime_settings()
+        assert PaperTrader.state_has_custom_settings(st_default) is False
+        assert PaperTrader.state_effective_max_open_positions(st_default) == PAPER_MAX_OPEN_POSITIONS
+
+        print("✅ ทดสอบตรรกะระบบจำลองการเทรด + Telegram Dashboard & Settings Self-Test (5 กรณี) ผ่าน 100%!")
 
 
 def main():
