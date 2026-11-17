@@ -291,6 +291,7 @@ impl AlertNotifier {
         let payload = json!({
             "commands": [
                 { "command": "portfolio", "description": "💼 ดูพอร์ตจำลอง + ปุ่มสั่งการ" },
+                { "command": "strategy", "description": "🎯 เลือกกลยุทธ์การเทรด + ดูสถิติแยกสาย" },
                 { "command": "settings", "description": "⚙️ ตั้งค่า Max ไม้ / ขนาด% / Leverage / ดาว" },
                 { "command": "set", "description": "🎛️ ตั้งค่าพอร์ตแบบพิมพ์เอง เช่น /set lev 15" },
                 { "command": "history", "description": "📜 ดูประวัติเทรด 10 รายการล่าสุด" },

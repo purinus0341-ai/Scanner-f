@@ -5,6 +5,7 @@ pub mod models;
 pub mod notifier;
 pub mod paper_trader;
 pub mod scanner;
+pub mod strategy;
 pub mod telegram_bot;
 
 use std::env;
@@ -159,6 +160,12 @@ fn print_startup_banner(cfg: &ScannerConfig) {
         cfg.funding_rate_threshold_pct,
         cfg.oi_spike_threshold_pct,
         format_compact_usd(cfg.min_liquidation_usd)
+    );
+    info!(
+        "• กลยุทธ์เริ่มต้น    : {} (Min {}⭐ | 1h Filter: {})",
+        cfg.scanner_strategy.title_th(),
+        cfg.scanner_strategy.default_min_stars(cfg.paper_min_stars),
+        if cfg.scanner_strategy.requires_1h_alignment() { "ตามเทรนด์ 1h เท่านั้น" } else { "ยืดหยุ่น" }
     );
     info!(
         "• จำลองการเทรด     : {} | ทุน ${:.0} | {:.0}x | ไม้ละ {:.0}% | Max {} ไม้ | >= {} ดาว",

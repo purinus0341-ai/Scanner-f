@@ -45,6 +45,219 @@ MIN_QUOTE_VOL_24H = float(os.environ.get("MIN_QUOTE_VOLUME_24H", "20000000"))
 MAX_SYMBOLS = int(os.environ.get("MAX_SYMBOLS", "100"))
 CANDLE_LIMIT = int(os.environ.get("CANDLE_BUFFER_SIZE", "65"))
 
+STRATEGY_ORDER = (
+    "BALANCED",
+    "TREND_FOLLOW",
+    "BREAKOUT",
+    "REVERSAL_SNIPER",
+    "SCALP_QUICK",
+)
+
+STRATEGIES = {
+    "BALANCED": {
+        "key": "BALANCED",
+        "short_tag": "Balanced",
+        "title_th": "⚖️ Balanced (สมดุล)",
+        "description_th": "ครบทุกสัญญาณ สมดุลทั้งตามเทรนด์และรอบสั้น (ค่ามาตรฐานระบบ)",
+        "signals_summary_th": "ทุกสัญญาณ (Pump/Dump, Vol, RSI, EMA, BB, Funding)",
+        "default_min_stars": None,
+        "require_1h_align": False,
+        "allowed_triggers": None,
+        "min_risk_pct": 0.70,
+        "max_risk_pct": 4.80,
+        "atr15_mult": 1.40,
+        "tp1_r": 1.3,
+        "tp2_r": 2.3,
+        "tp3_r": 3.6,
+        "tp1_atr5_mult": 2.2,
+        "tp2_atr15_mult": 2.2,
+        "tp3_atr1h_mult": 1.8,
+        "tp1_close_pct": 40.0,
+        "tp2_close_pct": 30.0,
+        "tp3_close_pct": 30.0,
+    },
+    "TREND_FOLLOW": {
+        "key": "TREND_FOLLOW",
+        "short_tag": "Trend",
+        "title_th": "📈 Trend Follow",
+        "description_th": "ตามเทรนด์ใหญ่ 1h เท่านั้น (EMA/BB/Vol) รันเป้าไกล ปิดหนัก TP2/TP3",
+        "signals_summary_th": "EMA Cross, BB Breakout, Volume Spike (บังคับตามเทรนด์ 1h)",
+        "default_min_stars": 3,
+        "require_1h_align": True,
+        "allowed_triggers": {
+            "EMA_BULL", "EMA_BEAR", "BB_UPPER", "BB_LOWER", "VOL_SPIKE",
+            "EMA_BULL_CROSS", "EMA_BEAR_CROSS", "BB_UPPER_BREAK", "BB_LOWER_BREAK", "VOLUME_SPIKE",
+        },
+        "min_risk_pct": 0.80,
+        "max_risk_pct": 4.80,
+        "atr15_mult": 1.50,
+        "tp1_r": 1.5,
+        "tp2_r": 2.8,
+        "tp3_r": 4.5,
+        "tp1_atr5_mult": 2.4,
+        "tp2_atr15_mult": 2.6,
+        "tp3_atr1h_mult": 2.2,
+        "tp1_close_pct": 25.0,
+        "tp2_close_pct": 35.0,
+        "tp3_close_pct": 40.0,
+    },
+    "BREAKOUT": {
+        "key": "BREAKOUT",
+        "short_tag": "Breakout",
+        "title_th": "💥 Breakout",
+        "description_th": "ดักทะลุกรอบ BB + แท่งกระชาก + วอลุ่มพุ่ง เก็บโมเมนตัมแรง",
+        "signals_summary_th": "BB Breakout, Pump/Dump, Volume Spike",
+        "default_min_stars": 2,
+        "require_1h_align": False,
+        "allowed_triggers": {
+            "BB_UPPER", "BB_LOWER", "PUMP", "DUMP", "VOL_SPIKE",
+            "BB_UPPER_BREAK", "BB_LOWER_BREAK", "PRICE_PUMP", "PRICE_DUMP", "VOLUME_SPIKE", "OI_SPIKE",
+        },
+        "min_risk_pct": 0.70,
+        "max_risk_pct": 4.20,
+        "atr15_mult": 1.35,
+        "tp1_r": 1.3,
+        "tp2_r": 2.4,
+        "tp3_r": 3.8,
+        "tp1_atr5_mult": 2.2,
+        "tp2_atr15_mult": 2.3,
+        "tp3_atr1h_mult": 1.9,
+        "tp1_close_pct": 35.0,
+        "tp2_close_pct": 35.0,
+        "tp3_close_pct": 30.0,
+    },
+    "REVERSAL_SNIPER": {
+        "key": "REVERSAL_SNIPER",
+        "short_tag": "Sniper",
+        "title_th": "🎯 Reversal Sniper",
+        "description_th": "ดักจุดกลับตัวสุดขั้ว (RSI OB/OS + Funding) SL กระชับ เก็บแม่น",
+        "signals_summary_th": "RSI Overbought/Oversold, Funding Extreme",
+        "default_min_stars": 3,
+        "require_1h_align": False,
+        "allowed_triggers": {
+            "RSI_OB", "RSI_OS", "FUNDING",
+            "RSI_OVERBOUGHT", "RSI_OVERSOLD", "FUNDING_EXTREME", "LIQUIDATION",
+        },
+        "min_risk_pct": 0.65,
+        "max_risk_pct": 3.80,
+        "atr15_mult": 1.25,
+        "tp1_r": 1.2,
+        "tp2_r": 2.0,
+        "tp3_r": 3.0,
+        "tp1_atr5_mult": 2.0,
+        "tp2_atr15_mult": 2.0,
+        "tp3_atr1h_mult": 1.5,
+        "tp1_close_pct": 50.0,
+        "tp2_close_pct": 35.0,
+        "tp3_close_pct": 15.0,
+    },
+    "SCALP_QUICK": {
+        "key": "SCALP_QUICK",
+        "short_tag": "Scalp",
+        "title_th": "⚡ Scalp Quick",
+        "description_th": "เล่นรอบสั้นไว 5m/15m จำกัด SL แคบ เน้นเก็บกำไรไวที่ TP1/TP2",
+        "signals_summary_th": "EMA Cross, RSI OB/OS, BB Breakout, Volume Spike, Pump/Dump",
+        "default_min_stars": 2,
+        "require_1h_align": False,
+        "allowed_triggers": {
+            "EMA_BULL", "EMA_BEAR", "RSI_OB", "RSI_OS", "BB_UPPER", "BB_LOWER", "VOL_SPIKE", "PUMP", "DUMP",
+            "EMA_BULL_CROSS", "EMA_BEAR_CROSS", "RSI_OVERBOUGHT", "RSI_OVERSOLD", "BB_UPPER_BREAK", "BB_LOWER_BREAK",
+            "VOLUME_SPIKE", "PRICE_PUMP", "PRICE_DUMP",
+        },
+        "min_risk_pct": 0.55,
+        "max_risk_pct": 2.80,
+        "atr15_mult": 1.15,
+        "tp1_r": 1.0,
+        "tp2_r": 1.7,
+        "tp3_r": 2.5,
+        "tp1_atr5_mult": 1.7,
+        "tp2_atr15_mult": 1.8,
+        "tp3_atr1h_mult": 1.4,
+        "tp1_close_pct": 50.0,
+        "tp2_close_pct": 35.0,
+        "tp3_close_pct": 15.0,
+    },
+}
+
+STRATEGY_ALIASES = {
+    "balanced": "BALANCED",
+    "bal": "BALANCED",
+    "all": "BALANCED",
+    "default": "BALANCED",
+    "standard": "BALANCED",
+    "สมดุล": "BALANCED",
+    "มาตรฐาน": "BALANCED",
+    "รวม": "BALANCED",
+    "trend_follow": "TREND_FOLLOW",
+    "trendfollow": "TREND_FOLLOW",
+    "trend": "TREND_FOLLOW",
+    "tf": "TREND_FOLLOW",
+    "ตามเทรนด์": "TREND_FOLLOW",
+    "breakout": "BREAKOUT",
+    "break": "BREAKOUT",
+    "bo": "BREAKOUT",
+    "momentum": "BREAKOUT",
+    "ทะลุกรอบ": "BREAKOUT",
+    "reversal_sniper": "REVERSAL_SNIPER",
+    "reversalsniper": "REVERSAL_SNIPER",
+    "reversal": "REVERSAL_SNIPER",
+    "sniper": "REVERSAL_SNIPER",
+    "rev": "REVERSAL_SNIPER",
+    "กลับตัว": "REVERSAL_SNIPER",
+    "สวน": "REVERSAL_SNIPER",
+    "scalp_quick": "SCALP_QUICK",
+    "scalpquick": "SCALP_QUICK",
+    "scalp": "SCALP_QUICK",
+    "scalping": "SCALP_QUICK",
+    "quick": "SCALP_QUICK",
+    "สั้น": "SCALP_QUICK",
+    "ไว": "SCALP_QUICK",
+}
+
+
+def normalize_strategy_key(raw):
+    if not raw:
+        return None
+    norm = str(raw).strip().lower().replace("-", "_").replace(" ", "_")
+    return STRATEGY_ALIASES.get(norm)
+
+
+def get_strategy(strategy_key):
+    canonical = normalize_strategy_key(strategy_key) or "BALANCED"
+    return STRATEGIES[canonical]
+
+
+def strategy_default_min_stars(strategy_key):
+    strat = get_strategy(strategy_key)
+    if strat["default_min_stars"] is None:
+        return max(1, min(3, PAPER_MIN_STARS))
+    return int(strat["default_min_stars"])
+
+
+def strategy_allows_category(strategy_key, cat_key):
+    strat = get_strategy(strategy_key)
+    allowed = strat["allowed_triggers"]
+    if allowed is None:
+        return True
+    return str(cat_key).strip().upper() in allowed
+
+
+def record_strategy_closed_trade(stats, strategy_key, net_pnl):
+    canonical = normalize_strategy_key(strategy_key) or "BALANCED"
+    entry = stats.get(canonical)
+    if not isinstance(entry, dict):
+        entry = {"trades": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0}
+        stats[canonical] = entry
+    entry["trades"] = int(entry.get("trades", 0)) + 1
+    if net_pnl >= 0:
+        entry["wins"] = int(entry.get("wins", 0)) + 1
+    else:
+        entry["losses"] = int(entry.get("losses", 0)) + 1
+    entry["realized_pnl"] = float(entry.get("realized_pnl", 0.0)) + float(net_pnl)
+
+
+SCANNER_STRATEGY = normalize_strategy_key(os.environ.get("SCANNER_STRATEGY", "")) or "BALANCED"
+
 PRICE_CHANGE_PCT = float(os.environ.get("PRICE_CHANGE_THRESHOLD_PCT", "2.2"))
 VOL_SPIKE_MULT = float(os.environ.get("VOLUME_SPIKE_MULTIPLIER", "3.2"))
 VOL_LOOKBACK = int(os.environ.get("VOLUME_LOOKBACK", "20"))
@@ -390,25 +603,27 @@ def evaluate_mtf_confluence(direction, is_reversal, state_5m, state_15m, state_1
     return stars, grade, aligned_1h, reasons
 
 
-def build_mtf_trade_plan(direction, price, state_5m, state_15m, state_1h, aligned_1h):
+def build_mtf_trade_plan(direction, price, state_5m, state_15m, state_1h, aligned_1h, strategy_key="BALANCED"):
     """
-    คำนวณจุดเข้า-ออกผสาน 3 Timeframe:
+    คำนวณจุดเข้า-ออกผสาน 3 Timeframe ปรับตามกลยุทธ์ที่เลือก:
       • จุดเข้า (Entry Zone) : คัดจุดเข้าคมๆ จาก ATR ของ 5m
       • จุดตัดขาดทุน (SL)     : วางตามโครงสร้าง Swing High/Low และ ATR ของ 15m (กันไส้เทียน 5m สะบัดกิน SL)
-      • เป้าทำกำไร (TP1/TP2/TP3):
-          - TP1 = เป้าสั้นตามกรอบ 5m/15m (1.3R)
-          - TP2 = เป้ากลางตามโครงสร้าง 15m (2.3R)
-          - TP3 = เป้ารันเทรนด์ตามกรอบ 1h (3.6R หรือ ATR 1h)
+      • เป้าทำกำไร (TP1/TP2/TP3): ปรับ R:R, ระยะ ATR ขั้นต่ำ และสัดส่วนแบ่งปิดตามโปรไฟล์ของกลยุทธ์
     """
     if price <= 0:
         return None
+
+    strat = get_strategy(strategy_key)
+    tp1_pct_close = float(strat["tp1_close_pct"])
+    tp2_pct_close = float(strat["tp2_close_pct"])
+    tp3_pct_close = float(strat["tp3_close_pct"])
 
     atr_5m = state_5m["atr"] if state_5m and state_5m["atr"] > 0 else price * 0.006
     atr_15m = state_15m["atr"] if state_15m and state_15m["atr"] > 0 else price * 0.012
     atr_1h = state_1h["atr"] if state_1h and state_1h["atr"] > 0 else price * 0.024
 
-    # คำนวณระยะ SL จากโครงสร้าง 15m (Swing Low / Swing High 8 แท่งล่าสุดของ 15m + Buffer 0.25*ATR_15m)
-    raw_risk = atr_15m * 1.4
+    # คำนวณระยะ SL จากโครงสร้าง 15m (Swing Low / Swing High 8 แท่งล่าสุดของ 15m + Buffer 0.20*ATR_15m)
+    raw_risk = atr_15m * strat["atr15_mult"]
     candles_15m = state_15m["candles"] if state_15m else []
     if len(candles_15m) >= 6:
         recent_15m = candles_15m[-8:] if len(candles_15m) >= 8 else candles_15m
@@ -423,15 +638,15 @@ def build_mtf_trade_plan(direction, price, state_5m, state_15m, state_1h, aligne
             if swing_dist > 0:
                 raw_risk = max(raw_risk, swing_dist)
 
-    min_risk = price * 0.007  # ขั้นต่ำ 0.70%
-    max_risk = price * 0.048  # สูงสุด 4.80%
+    min_risk = price * (strat["min_risk_pct"] / 100.0)
+    max_risk = price * (strat["max_risk_pct"] / 100.0)
     risk = max(min_risk, min(max_risk, raw_risk))
     risk_pct = (risk / price) * 100.0
 
-    # ระยะเป้าทำกำไร TP1 (สั้น 5m/15m), TP2 (กลาง 15m), TP3 (ใหญ่ 1h)
-    tp1_dist = max(risk * 1.3, atr_5m * 2.2)
-    tp2_dist = max(risk * 2.3, atr_15m * 2.2)
-    tp3_dist = max(risk * 3.6, atr_1h * 1.8)
+    # ระยะเป้าทำกำไร TP1 (5m), TP2 (15m), TP3 (1h) พร้อมบังคับเรียงห่างต่อเนื่องอย่างน้อย 1.25x
+    tp1_dist = max(risk * strat["tp1_r"], atr_5m * strat["tp1_atr5_mult"])
+    tp2_dist = max(risk * strat["tp2_r"], atr_15m * strat["tp2_atr15_mult"], tp1_dist * 1.25)
+    tp3_dist = max(risk * strat["tp3_r"], atr_1h * strat["tp3_atr1h_mult"], tp2_dist * 1.25)
 
     if direction == "BULL":
         entry_low = price - (0.30 * atr_5m)
@@ -444,12 +659,17 @@ def build_mtf_trade_plan(direction, price, state_5m, state_15m, state_1h, aligne
         tp3_pct = (tp3_dist / price) * 100.0
         side_note = "ตามเทรนด์ 1h รันเทรนด์ได้" if aligned_1h else "เล่นรอบสั้น เน้นแบ่งปิด TP1/TP2"
         return {
+            "strategy_key": strat["key"],
+            "strategy_title_th": strat["title_th"],
+            "tp1_close_pct": tp1_pct_close,
+            "tp2_close_pct": tp2_pct_close,
+            "tp3_close_pct": tp3_pct_close,
             "side_label": f"🟢 เปิด LONG ({side_note})",
             "entry_str": f"${fmt_price(entry_low)} - ${fmt_price(price)} (โซนรับ 5m)",
-            "tp1_str": f"${fmt_price(tp1)} (+{tp1_pct:.2f}%) [เป้าสั้น 5m]",
-            "tp2_str": f"${fmt_price(tp2)} (+{tp2_pct:.2f}%) [เป้ากลาง 15m]",
-            "tp3_str": f"${fmt_price(tp3)} (+{tp3_pct:.2f}%) [เป้ารันเทรนด์ 1h]",
-            "sl_str": f"${fmt_price(sl)} (-{risk_pct:.2f}%) [ใต้ฐาน 15m]",
+            "tp1_str": f"${fmt_price(tp1)} (+{tp1_pct:.2f}%) [ปิด {tp1_pct_close:.0f}% | เป้าสั้น]",
+            "tp2_str": f"${fmt_price(tp2)} (+{tp2_pct:.2f}%) [ปิด {tp2_pct_close:.0f}% | เป้ากลาง]",
+            "tp3_str": f"${fmt_price(tp3)} (+{tp3_pct:.2f}%) [ปิด {tp3_pct_close:.0f}% | เป้าไกล]",
+            "sl_str": f"${fmt_price(sl)} (-{risk_pct:.2f}%) [ฐาน 15m]",
             "entry_price": price,
             "sl": sl,
             "tp1": tp1,
@@ -468,12 +688,17 @@ def build_mtf_trade_plan(direction, price, state_5m, state_15m, state_1h, aligne
         tp3_pct = (tp3_dist / price) * 100.0
         side_note = "ตามเทรนด์ 1h รันเทรนด์ได้" if aligned_1h else "เล่นรอบสั้น เน้นแบ่งปิด TP1/TP2"
         return {
+            "strategy_key": strat["key"],
+            "strategy_title_th": strat["title_th"],
+            "tp1_close_pct": tp1_pct_close,
+            "tp2_close_pct": tp2_pct_close,
+            "tp3_close_pct": tp3_pct_close,
             "side_label": f"🔴 เปิด SHORT ({side_note})",
             "entry_str": f"${fmt_price(price)} - ${fmt_price(entry_high)} (โซนต้าน 5m)",
-            "tp1_str": f"${fmt_price(tp1)} (+{tp1_pct:.2f}%) [เป้าสั้น 5m]",
-            "tp2_str": f"${fmt_price(tp2)} (+{tp2_pct:.2f}%) [เป้ากลาง 15m]",
-            "tp3_str": f"${fmt_price(tp3)} (+{tp3_pct:.2f}%) [เป้ารันเทรนด์ 1h]",
-            "sl_str": f"${fmt_price(sl)} (-{risk_pct:.2f}%) [เหนือต้าน 15m]",
+            "tp1_str": f"${fmt_price(tp1)} (+{tp1_pct:.2f}%) [ปิด {tp1_pct_close:.0f}% | เป้าสั้น]",
+            "tp2_str": f"${fmt_price(tp2)} (+{tp2_pct:.2f}%) [ปิด {tp2_pct_close:.0f}% | เป้ากลาง]",
+            "tp3_str": f"${fmt_price(tp3)} (+{tp3_pct:.2f}%) [ปิด {tp3_pct_close:.0f}% | เป้าไกล]",
+            "sl_str": f"${fmt_price(sl)} (-{risk_pct:.2f}%) [ต้าน 15m]",
             "entry_price": price,
             "sl": sl,
             "tp1": tp1,
@@ -483,7 +708,7 @@ def build_mtf_trade_plan(direction, price, state_5m, state_15m, state_1h, aligne
         }
 
 
-CSV_HEADER = "timestamp,trade_id,event,symbol,side,stars,timeframe,signal,entry_price,exec_price,closed_pct,margin_used,leverage,gross_pnl_usdt,fee_usdt,net_pnl_usdt,balance_after_usdt,equity_after_usdt,note\n"
+CSV_HEADER = "timestamp,trade_id,event,symbol,side,stars,timeframe,signal,entry_price,exec_price,closed_pct,margin_used,leverage,gross_pnl_usdt,fee_usdt,net_pnl_usdt,balance_after_usdt,equity_after_usdt,note,strategy\n"
 
 
 def send_paper_webhook(title, symbol, lines_th, discord_color):
@@ -634,8 +859,9 @@ def tg_set_commands():
     payload = {
         "commands": [
             {"command": "portfolio", "description": "💼 ดูพอร์ตจำลอง + ปุ่มสั่งการ"},
+            {"command": "strategy", "description": "🎯 เลือกกลยุทธ์ 5 แบบ + สถิติแยกสาย"},
             {"command": "settings", "description": "⚙️ ตั้งค่า Max ไม้ / ขนาด% / Leverage / ดาว"},
-            {"command": "set", "description": "🎛️ ตั้งค่าพอร์ตแบบพิมพ์เอง เช่น /set lev 15"},
+            {"command": "set", "description": "🎛️ ตั้งค่าพอร์ตแบบพิมพ์เอง เช่น /set strategy trend lev 15"},
             {"command": "history", "description": "📜 ดูประวัติเทรด 10 รายการล่าสุด"},
             {"command": "scan", "description": "🔍 สแกนตลาด MTF ทันที 1 รอบ"},
             {"command": "pause", "description": "⏸️ พักการเปิดออเดอร์ใหม่ชั่วคราว"},
@@ -675,6 +901,8 @@ class PaperTrader:
             "custom_position_pct": None,
             "custom_max_open_positions": None,
             "custom_min_stars": None,
+            "custom_strategy": None,
+            "strategy_stats": {},
             "open_positions": [],
         }
 
@@ -688,11 +916,14 @@ class PaperTrader:
                         base.update(data)
                         if not isinstance(base.get("open_positions"), list):
                             base["open_positions"] = []
+                        if not isinstance(base.get("strategy_stats"), dict):
+                            base["strategy_stats"] = {}
                         base.setdefault("paused_opening", False)
                         base.setdefault("custom_leverage", None)
                         base.setdefault("custom_position_pct", None)
                         base.setdefault("custom_max_open_positions", None)
                         base.setdefault("custom_min_stars", None)
+                        base.setdefault("custom_strategy", None)
                         return base
             except Exception:
                 pass
@@ -710,9 +941,26 @@ class PaperTrader:
         with self._lock:
             return copy.deepcopy(self.state)
 
+    def get_effective_strategy_and_min_stars(self):
+        with self._lock:
+            return (
+                self.state_effective_strategy(self.state),
+                self.state_effective_min_stars(self.state),
+            )
+
     def set_paused(self, paused):
         with self._lock:
             self.state["paused_opening"] = bool(paused)
+            self.save_state()
+            return copy.deepcopy(self.state)
+
+    def set_strategy(self, strategy_key):
+        canonical = normalize_strategy_key(strategy_key) or "BALANCED"
+        with self._lock:
+            self.state["custom_strategy"] = canonical
+            # Switching strategy automatically clears custom_min_stars so the strategy's own Min Stars takes effect
+            # while Leverage, Position %, and Max Open Positions remain untouched.
+            self.state["custom_min_stars"] = None
             self.save_state()
             return copy.deepcopy(self.state)
 
@@ -739,6 +987,7 @@ class PaperTrader:
             self.state["custom_position_pct"] = None
             self.state["custom_max_open_positions"] = None
             self.state["custom_min_stars"] = None
+            self.state["custom_strategy"] = None
             self.save_state()
             return copy.deepcopy(self.state)
 
@@ -751,6 +1000,7 @@ class PaperTrader:
                     "custom_position_pct",
                     "custom_max_open_positions",
                     "custom_min_stars",
+                    "custom_strategy",
                 )
             }
             fresh = self._new_state()
@@ -765,28 +1015,33 @@ class PaperTrader:
             return copy.deepcopy(self.state)
 
     @staticmethod
+    def state_effective_strategy(st):
+        return normalize_strategy_key(st.get("custom_strategy")) or SCANNER_STRATEGY
+
+    @staticmethod
     def state_effective_leverage(st):
         raw = st.get("custom_leverage")
-        val = float(raw) if isinstance(raw, (int, float)) and math.isfinite(float(raw)) else float(PAPER_LEVERAGE)
+        val = float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(float(raw)) else float(PAPER_LEVERAGE)
         return max(1.0, min(125.0, val))
 
     @staticmethod
     def state_effective_position_pct(st):
         raw = st.get("custom_position_pct")
-        val = float(raw) if isinstance(raw, (int, float)) and math.isfinite(float(raw)) else float(PAPER_POSITION_PCT)
+        val = float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(float(raw)) else float(PAPER_POSITION_PCT)
         return max(1.0, min(100.0, val))
 
     @staticmethod
     def state_effective_max_open_positions(st):
         raw = st.get("custom_max_open_positions")
-        val = int(raw) if isinstance(raw, (int, float)) else int(PAPER_MAX_OPEN_POSITIONS)
+        val = int(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else int(PAPER_MAX_OPEN_POSITIONS)
         return max(1, min(30, val))
 
     @staticmethod
     def state_effective_min_stars(st):
         raw = st.get("custom_min_stars")
-        val = int(raw) if isinstance(raw, (int, float)) else int(PAPER_MIN_STARS)
-        return max(1, min(3, val))
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return max(1, min(3, int(raw)))
+        return strategy_default_min_stars(PaperTrader.state_effective_strategy(st))
 
     @staticmethod
     def state_has_custom_settings(st):
@@ -797,8 +1052,32 @@ class PaperTrader:
                 "custom_position_pct",
                 "custom_max_open_positions",
                 "custom_min_stars",
+                "custom_strategy",
             )
         )
+
+    @staticmethod
+    def pos_strategy(pos):
+        return normalize_strategy_key(pos.get("strategy")) or "BALANCED"
+
+    @staticmethod
+    def pos_tp_close_splits(pos):
+        raw1 = pos.get("tp1_close_pct")
+        raw2 = pos.get("tp2_close_pct")
+        tp1 = (
+            float(raw1)
+            if isinstance(raw1, (int, float)) and not isinstance(raw1, bool) and math.isfinite(float(raw1))
+            else 40.0
+        )
+        tp1 = max(10.0, min(80.0, tp1))
+        tp2 = (
+            float(raw2)
+            if isinstance(raw2, (int, float)) and not isinstance(raw2, bool) and math.isfinite(float(raw2))
+            else 30.0
+        )
+        tp2 = max(10.0, min(90.0 - tp1, tp2))
+        tp3 = max(5.0, 100.0 - tp1 - tp2)
+        return tp1, tp2, tp3
 
     def recent_csv_events(self, limit=10):
         with self._lock:
@@ -831,6 +1110,7 @@ class PaperTrader:
                     "side": cols[4],
                     "exec_price": exec_price,
                     "net_pnl": net_pnl,
+                    "strategy": cols[19].strip() if len(cols) > 19 else "",
                 }
             )
         if len(rows) > limit:
@@ -904,11 +1184,12 @@ class PaperTrader:
                 ts = datetime.now(timezone.utc).isoformat()
                 side_str = "LONG" if pos["side"] == "Long" else "SHORT"
                 safe_note = str(note).replace(",", ";")
+                strat_col = self.pos_strategy(pos)
                 f.write(
                     f"{ts},{trade_id},{event},{pos['symbol']},{side_str},{pos['stars']},{pos['timeframe']},"
                     f"{pos['signal_category']},{pos['entry_price']:.8f},{exec_price:.8f},{closed_pct:.1f},"
                     f"{pos['initial_margin']:.4f},{pos['leverage']:.1f},{gross_pnl:.4f},{fee:.4f},{net_pnl:.4f},"
-                    f"{free_after:.4f},{eq_after:.4f},{safe_note}\n"
+                    f"{free_after:.4f},{eq_after:.4f},{safe_note},{strat_col}\n"
                 )
         except Exception as e:
             print(f"⚠️ บันทึกไฟล์ {self.csv_file} ไม่สำเร็จ: {e}")
@@ -926,6 +1207,8 @@ class PaperTrader:
         with self._lock:
             if self.state.get("paused_opening"):
                 return None
+            eff_strat_key = self.state_effective_strategy(self.state)
+            eff_strat = get_strategy(eff_strat_key)
             eff_min_stars = self.state_effective_min_stars(self.state)
             if stars < eff_min_stars:
                 return None
@@ -965,6 +1248,9 @@ class PaperTrader:
                 "stars": stars,
                 "signal_category": category_key,
                 "timeframe": timeframe,
+                "strategy": eff_strat["key"],
+                "tp1_close_pct": float(eff_strat["tp1_close_pct"]),
+                "tp2_close_pct": float(eff_strat["tp2_close_pct"]),
                 "entry_price": entry_price,
                 "initial_sl": plan["sl"],
                 "current_sl": plan["sl"],
@@ -1001,17 +1287,18 @@ class PaperTrader:
                 -entry_fee,
                 free_after,
                 eq_after,
-                f"{category_key} ({stars}*)",
+                f"{category_key} ({stars}* | {eff_strat['short_tag']})",
             )
             self.save_state()
 
+            tp1_pct, tp2_pct, tp3_pct = self.pos_tp_close_splits(pos)
             side_emoji = "🟢 LONG" if side == "Long" else "🔴 SHORT"
             title = f"🧪 [PAPER] เปิดไม้ #{trade_id} {side_emoji} {symbol}"
             lines_th = [
-                f"⭐ สัญญาณ: {category_key} ({stars} ดาว | TF: {timeframe})",
+                f"🎯 กลยุทธ์: {eff_strat['title_th']} | ⭐ {category_key} ({stars} ดาว | TF: {timeframe})",
                 f"💰 Margin: ${margin:.2f} ({fmt_num_clean(eff_leverage)}x | มูลค่าสัญญา ${notional:.2f})",
                 f"🎯 ราคาเข้า (Entry): ${fmt_price(entry_price)}",
-                f"📊 เป้าปิด 3 ส่วน: TP1 ${fmt_price(plan['tp1'])} (40%) | TP2 ${fmt_price(plan['tp2'])} (30%) | TP3 ${fmt_price(plan['tp3'])} (30%)",
+                f"📊 เป้าปิด 3 ส่วน: TP1 ${fmt_price(plan['tp1'])} ({tp1_pct:.0f}%) | TP2 ${fmt_price(plan['tp2'])} ({tp2_pct:.0f}%) | TP3 ${fmt_price(plan['tp3'])} ({tp3_pct:.0f}%)",
                 f"🛡️ Stop Loss: ${fmt_price(plan['sl'])} (-{plan['risk_pct']:.2f}%) | ค่าธรรมเนียม: ${entry_fee:.2f}",
                 f"💼 พอร์ตปัจจุบัน: Equity ${eq_after:.2f} | ถืออยู่ {len(self.state['open_positions'])}/{eff_max_pos} ไม้",
             ]
@@ -1033,6 +1320,8 @@ class PaperTrader:
         with self._lock:
             if not self.state["open_positions"]:
                 return
+            if not isinstance(self.state.get("strategy_stats"), dict):
+                self.state["strategy_stats"] = {}
 
             fee_rate = PAPER_TAKER_FEE_PCT / 100.0
             idx = 0
@@ -1046,6 +1335,9 @@ class PaperTrader:
 
                 pos["last_price"] = price
                 is_long = pos["side"] == "Long"
+                tp1_pct, tp2_pct, tp3_pct = self.pos_tp_close_splits(pos)
+                pos_strat_key = self.pos_strategy(pos)
+                pos_strat = get_strategy(pos_strat_key)
 
                 # 1. เช็ค Stop Loss
                 sl_hit = (price <= pos["current_sl"]) if is_long else (price >= pos["current_sl"])
@@ -1072,6 +1364,7 @@ class PaperTrader:
                         self.state["win_count"] += 1
                     else:
                         self.state["loss_count"] += 1
+                    record_strategy_closed_trade(self.state["strategy_stats"], pos_strat_key, pos["realized_pnl_trade"])
 
                     self.state["open_positions"].pop(idx)
                     self.update_drawdown()
@@ -1095,7 +1388,7 @@ class PaperTrader:
                     side_str = "LONG" if is_long else "SHORT"
                     title = f"{icon} [PAPER] ปิดไม้ #{pos['id']} {sym} — {label}"
                     lines_th = [
-                        f"📌 สถานะ: {side_str} ({label})",
+                        f"📌 สถานะ: {side_str} ({label}) | 🎯 {pos_strat['title_th']}",
                         f"🎯 Entry: ${fmt_price(pos['entry_price'])} -> Exit: ${fmt_price(exec_price)}",
                         f"💵 กำไร/ขาดทุนสุทธิไม้นี้: {pos['realized_pnl_trade']:+.2f} USDT (ค่าธรรมเนียมรวม ${pos['fees_paid_trade']:.2f})",
                         f"📊 สถิติพอร์ต: Equity ${eq_after:.2f} | Win Rate {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L) | Max DD {self.state['max_drawdown_pct']:.2f}%",
@@ -1103,10 +1396,11 @@ class PaperTrader:
                     notifications.append((title, sym, lines_th, 0x00E676 if pos["realized_pnl_trade"] >= 0 else 0xFF5252))
                     continue
 
-                # 2. เช็ค TP1 (ปิด 40% + เลื่อน SL กันทุน)
+                # 2. เช็ค TP1 (ปิด tp1_pct% + เลื่อน SL กันทุน)
                 tp1_hit_now = (not pos["tp1_hit"]) and ((price >= pos["tp1"]) if is_long else (price <= pos["tp1"]))
                 if tp1_hit_now:
-                    frac = 0.40
+                    frac = tp1_pct / 100.0
+                    remain_after_tp1 = max(0.0, 100.0 - tp1_pct)
                     close_qty = pos["initial_qty"] * frac
                     margin_released = pos["initial_margin"] * frac
                     exec_price = pos["tp1"]
@@ -1131,19 +1425,31 @@ class PaperTrader:
                     eq_after = self.total_equity()
                     free_after = self.state["free_balance"]
 
-                    self.append_csv(pos["id"], "TP1_PARTIAL", pos, exec_price, 40.0, gross, exit_fee, net_step, free_after, eq_after, "Closed 40% & Moved SL to Breakeven")
-                    title = f"💰 [PAPER] TP1 แตก! #{pos['id']} {sym} (+ปิด 40%)"
+                    self.append_csv(
+                        pos["id"],
+                        "TP1_PARTIAL",
+                        pos,
+                        exec_price,
+                        tp1_pct,
+                        gross,
+                        exit_fee,
+                        net_step,
+                        free_after,
+                        eq_after,
+                        f"Closed {tp1_pct:.0f}% & Moved SL to Breakeven",
+                    )
+                    title = f"💰 [PAPER] TP1 แตก! #{pos['id']} {sym} (+ปิด {tp1_pct:.0f}%)"
                     lines_th = [
-                        f"🎯 ชนเป้า TP1 ที่ ${fmt_price(exec_price)} (เก็บกำไร 40% = {net_step:+.2f} USDT)",
+                        f"🎯 ชนเป้า TP1 ที่ ${fmt_price(exec_price)} (เก็บกำไร {tp1_pct:.0f}% = {net_step:+.2f} USDT) [{pos_strat['short_tag']}]",
                         f"🛡️ เลื่อน SL กันทุน (Breakeven) อัตโนมัติ -> ${fmt_price(pos['current_sl'])}",
-                        f"💼 เหลือถือรันต่อ 60% ลุ้น TP2 (${fmt_price(pos['tp2'])}) / TP3 (${fmt_price(pos['tp3'])}) | Equity ${eq_after:.2f}",
+                        f"💼 เหลือถือรันต่อ {remain_after_tp1:.0f}% ลุ้น TP2 (${fmt_price(pos['tp2'])}) / TP3 (${fmt_price(pos['tp3'])}) | Equity ${eq_after:.2f}",
                     ]
                     notifications.append((title, sym, lines_th, 0x00E676))
 
-                # 3. เช็ค TP2 (ปิด 30% + เลื่อน SL ล็อกกำไรที่ TP1)
+                # 3. เช็ค TP2 (ปิด tp2_pct% + เลื่อน SL ล็อกกำไรที่ TP1)
                 tp2_hit_now = pos["tp1_hit"] and (not pos["tp2_hit"]) and ((price >= pos["tp2"]) if is_long else (price <= pos["tp2"]))
                 if tp2_hit_now:
-                    frac = 0.30
+                    frac = tp2_pct / 100.0
                     close_qty = pos["initial_qty"] * frac
                     margin_released = pos["initial_margin"] * frac
                     exec_price = pos["tp2"]
@@ -1166,16 +1472,28 @@ class PaperTrader:
                     eq_after = self.total_equity()
                     free_after = self.state["free_balance"]
 
-                    self.append_csv(pos["id"], "TP2_PARTIAL", pos, exec_price, 30.0, gross, exit_fee, net_step, free_after, eq_after, "Closed 30% & Trailed SL to TP1")
-                    title = f"🚀 [PAPER] TP2 แตก! #{pos['id']} {sym} (+ปิดอีก 30%)"
+                    self.append_csv(
+                        pos["id"],
+                        "TP2_PARTIAL",
+                        pos,
+                        exec_price,
+                        tp2_pct,
+                        gross,
+                        exit_fee,
+                        net_step,
+                        free_after,
+                        eq_after,
+                        f"Closed {tp2_pct:.0f}% & Trailed SL to TP1",
+                    )
+                    title = f"🚀 [PAPER] TP2 แตก! #{pos['id']} {sym} (+ปิดอีก {tp2_pct:.0f}%)"
                     lines_th = [
-                        f"🎯 ชนเป้า TP2 ที่ ${fmt_price(exec_price)} (เก็บกำไรเพิ่ม 30% = {net_step:+.2f} USDT)",
+                        f"🎯 ชนเป้า TP2 ที่ ${fmt_price(exec_price)} (เก็บกำไรเพิ่ม {tp2_pct:.0f}% = {net_step:+.2f} USDT) [{pos_strat['short_tag']}]",
                         f"🔒 เลื่อน Trailing SL ล็อกกำไรที่ TP1 -> ${fmt_price(pos['current_sl'])}",
-                        f"💼 เหลือถือรันต่อ 30% ลุ้น TP3 (${fmt_price(pos['tp3'])}) | Equity ${eq_after:.2f}",
+                        f"💼 เหลือถือรันต่อ {tp3_pct:.0f}% ลุ้น TP3 (${fmt_price(pos['tp3'])}) | Equity ${eq_after:.2f}",
                     ]
                     notifications.append((title, sym, lines_th, 0x00E676))
 
-                # 4. เช็ค TP3 (ปิด 30% สุดท้าย)
+                # 4. เช็ค TP3 (ปิด tp3_pct% สุดท้าย)
                 tp3_hit_now = pos["tp2_hit"] and ((price >= pos["tp3"]) if is_long else (price <= pos["tp3"]))
                 if tp3_hit_now:
                     close_qty = pos["remaining_qty"]
@@ -1199,16 +1517,29 @@ class PaperTrader:
                         self.state["win_count"] += 1
                     else:
                         self.state["loss_count"] += 1
+                    record_strategy_closed_trade(self.state["strategy_stats"], pos_strat_key, pos["realized_pnl_trade"])
 
                     self.state["open_positions"].pop(idx)
                     self.update_drawdown()
                     eq_after = self.total_equity()
                     free_after = self.state["free_balance"]
 
-                    self.append_csv(pos["id"], "TP3_FULL_CLOSE", pos, exec_price, 30.0, gross, exit_fee, net_step, free_after, eq_after, "Hit TP3 Full Take Profit")
+                    self.append_csv(
+                        pos["id"],
+                        "TP3_FULL_CLOSE",
+                        pos,
+                        exec_price,
+                        tp3_pct,
+                        gross,
+                        exit_fee,
+                        net_step,
+                        free_after,
+                        eq_after,
+                        "Hit TP3 Full Take Profit",
+                    )
                     title = f"🏆 [PAPER] ปิดกำไรครบ 3 เป้า! #{pos['id']} {sym}"
                     lines_th = [
-                        f"🎯 ชนเป้า TP3 ที่ ${fmt_price(exec_price)} (ปิด 30% สุดท้าย = {net_step:+.2f} USDT)",
+                        f"🎯 ชนเป้า TP3 ที่ ${fmt_price(exec_price)} (ปิด {tp3_pct:.0f}% สุดท้าย = {net_step:+.2f} USDT) [{pos_strat['title_th']}]",
                         f"💎 กำไรรวมสุทธิทั้งไม้: {pos['realized_pnl_trade']:+.2f} USDT (ค่าธรรมเนียมรวม ${pos['fees_paid_trade']:.2f})",
                         f"📊 สถิติพอร์ต: Equity ${eq_after:.2f} | Win Rate {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L) | Max DD {self.state['max_drawdown_pct']:.2f}%",
                     ]
@@ -1235,6 +1566,8 @@ class PaperTrader:
             if idx is None:
                 return None
             pos = self.state["open_positions"].pop(idx)
+            if not isinstance(self.state.get("strategy_stats"), dict):
+                self.state["strategy_stats"] = {}
             sym = pos["symbol"]
             exec_price = float(market_prices.get(sym, 0.0)) if market_prices else 0.0
             if exec_price <= 0:
@@ -1265,6 +1598,10 @@ class PaperTrader:
             else:
                 self.state["loss_count"] += 1
 
+            pos_strat_key = self.pos_strategy(pos)
+            pos_strat = get_strategy(pos_strat_key)
+            record_strategy_closed_trade(self.state["strategy_stats"], pos_strat_key, pos["realized_pnl_trade"])
+
             self.update_drawdown()
             eq_after = self.total_equity()
             free_after = self.state["free_balance"]
@@ -1276,7 +1613,7 @@ class PaperTrader:
             side_str = "LONG" if is_long else "SHORT"
             title = f"{icon} [PAPER] ปิดมือ #{pos['id']} {sym} — สั่งปิดจาก Telegram"
             lines_th = [
-                f"📌 สถานะ: {side_str} (ปิดด้วยตนเอง)",
+                f"📌 สถานะ: {side_str} (ปิดด้วยตนเอง) | 🎯 {pos_strat['title_th']}",
                 f"🎯 Entry: ${fmt_price(pos['entry_price'])} -> Exit: ${fmt_price(exec_price)}",
                 f"💵 กำไร/ขาดทุนสุทธิไม้นี้: {pos['realized_pnl_trade']:+.2f} USDT (ค่าธรรมเนียมรวม ${pos['fees_paid_trade']:.2f})",
                 f"📊 สถิติพอร์ต: Equity ${eq_after:.2f} | Win Rate {self.win_rate_pct():.1f}% ({self.state['win_count']}W/{self.state['loss_count']}L)",
@@ -1308,6 +1645,7 @@ class PaperTrader:
         eq = self.state_total_equity(st)
         init_bal = st["initial_balance"]
         net_pct = ((eq - init_bal) / init_bal * 100.0) if init_bal > 0 else 0.0
+        eff_strat = get_strategy(self.state_effective_strategy(st))
         eff_lev = self.state_effective_leverage(st)
         eff_pct = self.state_effective_position_pct(st)
         eff_max = self.state_effective_max_open_positions(st)
@@ -1317,7 +1655,7 @@ class PaperTrader:
         print("\n--------------------------------------------------------------")
         print(f"💼 พอร์ตจำลอง (Paper Trading){pause_txt} | Equity: ${eq:.2f} ({net_pct:+.2f}%) | ทุนตั้งต้น: ${init_bal:.2f}")
         print(
-            f"   • ตั้งค่าไม้: {fmt_num_clean(eff_lev)}x | ไม้ละ {fmt_num_clean(eff_pct)}% | Max {eff_max} ไม้ | >= {eff_stars} ดาว{custom_tag}"
+            f"   • กลยุทธ์: {eff_strat['title_th']} | ตั้งค่าไม้: {fmt_num_clean(eff_lev)}x | ไม้ละ {fmt_num_clean(eff_pct)}% | Max {eff_max} ไม้ | >= {eff_stars} ดาว{custom_tag}"
         )
         print(f"   • เงินว่าง: ${st['free_balance']:.2f} | Margin ถืออยู่: ${self.state_locked_margin(st):.2f} | uPnL: {self.state_unrealized_pnl(st):+.2f} USDT")
         print(f"   • ปิดไม้แล้ว: {st['total_closed']} | Win Rate: {self.state_win_rate_pct(st):.1f}% ({st['win_count']}W/{st['loss_count']}L) | Realized: {st['realized_pnl']:+.2f} | Max DD: {st['max_drawdown_pct']:.2f}%")
@@ -1329,9 +1667,15 @@ class PaperTrader:
                 upnl = self.pos_unrealized_pnl(p)
                 uroe = self.pos_unrealized_roe_pct(p)
                 side_str = "🟢 LONG" if p["side"] == "Long" else "🔴 SHORT"
-                stage = "ผ่าน TP1+TP2 (30%)" if p["tp2_hit"] else ("ผ่าน TP1+กันทุน (60%)" if p["tp1_hit"] else "รอ TP1 (100%)")
+                remain_pct = round(float(p.get("remaining_fraction", 1.0)) * 100.0)
+                pos_strat = get_strategy(self.pos_strategy(p))
+                stage = (
+                    f"ผ่าน TP1+TP2 (ถือ {remain_pct:.0f}%)"
+                    if p["tp2_hit"]
+                    else (f"ผ่าน TP1+กันทุน (ถือ {remain_pct:.0f}%)" if p["tp1_hit"] else "รอ TP1 (ถือ 100%)")
+                )
                 print(
-                    f"     #{p['id']} {side_str} {p['symbol']} | Entry ${fmt_price(p['entry_price'])} -> ${fmt_price(p['last_price'])} | "
+                    f"     #{p['id']} {side_str} {p['symbol']} [{pos_strat['short_tag']}] | Entry ${fmt_price(p['entry_price'])} -> ${fmt_price(p['last_price'])} | "
                     f"uPnL {upnl:+.2f} ({uroe:+.1f}%) | SL ${fmt_price(p['current_sl'])} | {stage}"
                 )
         print("--------------------------------------------------------------")
@@ -1364,7 +1708,7 @@ def parse_set_command_args(args):
         tokens.append(raw)
 
     if not tokens:
-        return ("error", "กรุณาระบุค่าที่ต้องการ เช่น /set lev 15 หรือ /set max 8 size 12")
+        return ("error", "กรุณาระบุค่าที่ต้องการ เช่น /set lev 15 หรือ /set strategy trend")
 
     if len(tokens) == 1 and tokens[0].strip().lower() in ("default", "reset", ".env", "ค่าเริ่มต้น"):
         return ("reset", None)
@@ -1374,6 +1718,7 @@ def parse_set_command_args(args):
         "position_pct": None,
         "leverage": None,
         "min_stars": None,
+        "strategy": None,
     }
     updated_any = False
     i = 0
@@ -1383,10 +1728,16 @@ def parse_set_command_args(args):
         if key in ("default", "reset", ".env", "ค่าเริ่มต้น"):
             return ("reset", None)
         if i + 1 >= len(tokens):
-            return ("error", f"ยังไม่ได้ใส่ตัวเลขหลัง `{raw_key}` (เช่น /set {raw_key} 10)")
+            return ("error", f"ยังไม่ได้ใส่ค่าหลัง `{raw_key}` (เช่น /set strategy trend หรือ /set lev 15)")
         raw_val = tokens[i + 1].strip()
 
-        if key in ("max", "maxpos", "max_pos", "max_positions", "positions", "pos", "limit", "ไม้"):
+        if key in ("strategy", "strat", "mode", "profile", "กลยุทธ์", "สาย"):
+            parsed = normalize_strategy_key(raw_val)
+            if parsed is None:
+                return ("error", f"ไม่รู้จักกลยุทธ์ `{raw_val}` — เลือกได้: balanced, trend, breakout, reversal, scalp")
+            updates["strategy"] = parsed
+            updated_any = True
+        elif key in ("max", "maxpos", "max_pos", "max_positions", "positions", "pos", "limit", "ไม้"):
             cleaned = raw_val.removesuffix("ไม้").strip() if hasattr(raw_val, "removesuffix") else (raw_val[:-3].strip() if raw_val.endswith("ไม้") else raw_val)
             try:
                 parsed = int(cleaned)
@@ -1430,7 +1781,7 @@ def parse_set_command_args(args):
             updates["min_stars"] = max(1, min(3, parsed))
             updated_any = True
         else:
-            return ("error", f"ไม่รู้จักหัวข้อ `{raw_key}` — ใช้ max, size, lev, stars หรือ default")
+            return ("error", f"ไม่รู้จักหัวข้อ `{raw_key}` — ใช้ strategy, max, size, lev, stars หรือ default")
         i += 2
 
     if not updated_any:
@@ -1445,11 +1796,14 @@ def render_dashboard_html(st, notice_line=None):
     net_pct = (net_usdt / init_bal * 100.0) if init_bal > 0 else 0.0
     status_badge = "⏸️ พักเปิดไม้ใหม่ชั่วคราว" if st.get("paused_opening") else "🟢 เปิดรับสัญญาณอัตโนมัติ"
 
+    eff_strat_key = PaperTrader.state_effective_strategy(st)
+    eff_strat = get_strategy(eff_strat_key)
     eff_lev = PaperTrader.state_effective_leverage(st)
     eff_pct = PaperTrader.state_effective_position_pct(st)
     eff_max = PaperTrader.state_effective_max_open_positions(st)
     eff_stars = PaperTrader.state_effective_min_stars(st)
     custom_badge = " [ปรับเอง]" if PaperTrader.state_has_custom_settings(st) else ""
+    strat_lock = " [1h Lock]" if eff_strat["require_1h_align"] else ""
 
     lines = []
     if notice_line:
@@ -1457,6 +1811,7 @@ def render_dashboard_html(st, notice_line=None):
         lines.append("")
     lines.append("💼 <b>พอร์ตจำลองการเทรด (Paper Trading Dashboard)</b>")
     lines.append(f"• สถานะเปิดไม้ใหม่: <code>{status_badge}</code>")
+    lines.append(f"• กลยุทธ์ที่ใช้งาน: <code>{html.escape(eff_strat['title_th'])}{strat_lock}</code>")
     lines.append(
         f"• ตั้งค่าไม้: <code>{fmt_num_clean(eff_lev)}x | ไม้ละ {fmt_num_clean(eff_pct)}% | สูงสุด {eff_max} ไม้ | ≥ {eff_stars}⭐{custom_badge}</code>"
     )
@@ -1479,11 +1834,18 @@ def render_dashboard_html(st, notice_line=None):
         lines.append(f"📌 <b>ออเดอร์ที่ถืออยู่ ({len(open_pos)}/{eff_max} ไม้):</b>")
         for idx, p in enumerate(open_pos, start=1):
             side_icon = "🟢 LONG" if p["side"] == "Long" else "🔴 SHORT"
-            stage = "TP1+TP2 (ถือ 30%)" if p["tp2_hit"] else ("กันทุน BE (ถือ 60%)" if p["tp1_hit"] else "รอ TP1 (ถือ 100%)")
+            remain_pct = round(float(p.get("remaining_fraction", 1.0)) * 100.0)
+            pos_strat = get_strategy(PaperTrader.pos_strategy(p))
+            stage = (
+                f"TP1+TP2 (ถือ {remain_pct:.0f}%)"
+                if p["tp2_hit"]
+                else (f"กันทุน BE (ถือ {remain_pct:.0f}%)" if p["tp1_hit"] else "รอ TP1 (ถือ 100%)")
+            )
             upnl = PaperTrader.pos_unrealized_pnl(p)
             uroe = PaperTrader.pos_unrealized_roe_pct(p)
             lines.append(
-                f"{idx}) #{p['id']} {side_icon} <b>{html.escape(p['symbol'])}</b> | <code>${fmt_price(p['entry_price'])}</code> → <code>${fmt_price(p['last_price'])}</code>"
+                f"{idx}) #{p['id']} {side_icon} <b>{html.escape(p['symbol'])}</b> [{html.escape(pos_strat['short_tag'])}] | "
+                f"<code>${fmt_price(p['entry_price'])}</code> → <code>${fmt_price(p['last_price'])}</code>"
             )
             lines.append(
                 f"   uPnL: <code>{upnl:+.2f} USDT ({uroe:+.1f}%)</code> | SL: <code>${fmt_price(p['current_sl'])}</code> | {stage}"
@@ -1515,14 +1877,99 @@ def render_dashboard_html(st, notice_line=None):
         )
     rows.append(
         [
+            {"text": f"🎯 กลยุทธ์ ({eff_strat['short_tag']})", "callback_data": "paper:strategy"},
             {"text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings"},
+        ]
+    )
+    rows.append(
+        [
             {"text": f"🔄 รีเซ็ตพอร์ต (${PAPER_INITIAL_BALANCE:.0f})", "callback_data": "paper:reset_prompt"},
         ]
     )
     return "\n".join(lines), rows
 
 
+def render_strategy_html(st, notice_line=None):
+    eff_strat_key = PaperTrader.state_effective_strategy(st)
+    eff_strat = get_strategy(eff_strat_key)
+    eff_stars = PaperTrader.state_effective_min_stars(st)
+    default_stars = strategy_default_min_stars(eff_strat_key)
+    strat_source = "🎛️ เลือกผ่าน Telegram" if st.get("custom_strategy") is not None else "📄 ค่าเริ่มต้น .env"
+
+    lines = []
+    if notice_line:
+        lines.append(f"ℹ️ <i>{html.escape(str(notice_line))}</i>")
+        lines.append("")
+    lines.append("🎯 <b>เลือกกลยุทธ์การสแกน &amp; จำลองการเทรด</b>")
+    lines.append(
+        f"• กลยุทธ์ปัจจุบัน: <b>{html.escape(eff_strat['title_th'])}</b> (<code>{strat_source}</code>)"
+    )
+    lines.append(f"• แนวทาง: <i>{html.escape(eff_strat['description_th'])}</i>")
+    lines.append(f"• สัญญาณที่รับ: <code>{html.escape(eff_strat['signals_summary_th'])}</code>")
+    lines.append(
+        f"• เงื่อนไข MTF &amp; ดาว: <code>{'บังคับตามเทรนด์ 1h' if eff_strat['require_1h_align'] else 'ยืดหยุ่น 1h'} | เกณฑ์เข้า ≥ {eff_stars}⭐ (ค่าเริ่มต้นสายนี้ ≥ {default_stars}⭐)</code>"
+    )
+    lines.append(
+        f"• แผน SL/TP: <code>SL {eff_strat['min_risk_pct']:.2f}%–{eff_strat['max_risk_pct']:.2f}% | "
+        f"TP {eff_strat['tp1_r']:.1f}R/{eff_strat['tp2_r']:.1f}R/{eff_strat['tp3_r']:.1f}R | "
+        f"แบ่งปิด {eff_strat['tp1_close_pct']:.0f}/{eff_strat['tp2_close_pct']:.0f}/{eff_strat['tp3_close_pct']:.0f}%</code>"
+    )
+
+    lines.append("")
+    lines.append("📚 <b>สรุป 5 กลยุทธ์ (กดปุ่มเพื่อสลับได้ทันที):</b>")
+    for k in STRATEGY_ORDER:
+        s = STRATEGIES[k]
+        active_mark = "✅ " if k == eff_strat_key else "• "
+        lines.append(
+            f"{active_mark}<b>{html.escape(s['title_th'])}</b> (≥{strategy_default_min_stars(k)}⭐ | "
+            f"{fmt_num_clean(s['tp1_close_pct'])}/{fmt_num_clean(s['tp2_close_pct'])}/{fmt_num_clean(s['tp3_close_pct'])}% | Max SL {s['max_risk_pct']:.1f}%)"
+        )
+
+    lines.append("")
+    lines.append("📊 <b>สถิติ Win Rate / PnL แยกตามกลยุทธ์:</b>")
+    stats_map = st.get("strategy_stats") if isinstance(st.get("strategy_stats"), dict) else {}
+    any_stats = False
+    for k in STRATEGY_ORDER:
+        s = STRATEGIES[k]
+        perf = stats_map.get(k)
+        if isinstance(perf, dict) and int(perf.get("trades", 0)) > 0:
+            any_stats = True
+            trades = int(perf.get("trades", 0))
+            wins = int(perf.get("wins", 0))
+            losses = int(perf.get("losses", 0))
+            pnl = float(perf.get("realized_pnl", 0.0))
+            wr = (wins / trades * 100.0) if trades > 0 else 0.0
+            lines.append(
+                f"• {html.escape(s['short_tag'])}: <code>{trades} ไม้</code> | WR <code>{wr:.1f}%</code> (<code>{wins}W/{losses}L</code>) | PnL <code>{pnl:+.2f} USDT</code>"
+            )
+    if not any_stats:
+        lines.append("• <i>ยังไม่มีประวัติปิดไม้แยกตามกลยุทธ์ (จะบันทึกอัตโนมัติเมื่อปิดออเดอร์)</i>")
+
+    lines.append("")
+    lines.append("💡 <i>สลับกลยุทธ์จะตั้งค่า Min ดาว ตามสายนั้นให้อัตโนมัติ (คง Lev/Size/Max เดิม) และไม้ที่ถืออยู่แล้วยังปิดตามแผนเดิม</i>")
+    lines.append("⌨️ <b>คำสั่งด่วน:</b> <code>/strategy trend</code> · <code>/set strategy scalp lev 15</code>")
+
+    def strat_btn(k):
+        s = STRATEGIES[k]
+        label = f"✅ {s['title_th']}" if k == eff_strat_key else s["title_th"]
+        return {"text": label, "callback_data": f"paper:strat:{k}"}
+
+    kb = [
+        [strat_btn("BALANCED"), strat_btn("TREND_FOLLOW")],
+        [strat_btn("BREAKOUT"), strat_btn("REVERSAL_SNIPER")],
+        [strat_btn("SCALP_QUICK")],
+        [
+            {"text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings"},
+            {"text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh"},
+        ],
+    ]
+    return "\n".join(lines), kb
+
+
 def render_settings_html(st, notice_line=None):
+    eff_strat_key = PaperTrader.state_effective_strategy(st)
+    eff_strat = get_strategy(eff_strat_key)
+    env_strat = get_strategy(SCANNER_STRATEGY)
     eff_max = PaperTrader.state_effective_max_open_positions(st)
     eff_pct = PaperTrader.state_effective_position_pct(st)
     eff_lev = PaperTrader.state_effective_leverage(st)
@@ -1545,8 +1992,13 @@ def render_settings_html(st, notice_line=None):
     if notice_line:
         lines.append(f"ℹ️ <i>{html.escape(str(notice_line))}</i>")
         lines.append("")
-    lines.append("⚙️ <b>ตั้งค่าจำนวนไม้ & ขนาดไม้พอร์ตจำลอง</b>")
+    lines.append("⚙️ <b>ตั้งค่าจำนวนไม้ &amp; ขนาดไม้พอร์ตจำลอง</b>")
     lines.append(f"• แหล่งค่าตั้ง: {source_badge}")
+    lines.append(
+        f"• กลยุทธ์ที่ใช้งาน: <code>{html.escape(eff_strat['title_th'])}</code> "
+        f"(SL {eff_strat['min_risk_pct']:.2f}%–{eff_strat['max_risk_pct']:.2f}% | "
+        f"TP ปิด {eff_strat['tp1_close_pct']:.0f}/{eff_strat['tp2_close_pct']:.0f}/{eff_strat['tp3_close_pct']:.0f}%)"
+    )
     lines.append(f"• จำนวนไม้สูงสุด (Max): <code>{eff_max} ไม้</code> (กำลังถืออยู่ {open_cnt}/{eff_max})")
     lines.append(
         f"• ขนาดต่อไม้ (Size): <code>{fmt_num_clean(eff_pct)}%</code> (~<code>${est_margin:.2f} USDT</code>/ไม้ @ Equity <code>${eq:.2f}</code>)"
@@ -1557,13 +2009,13 @@ def render_settings_html(st, notice_line=None):
     lines.append(f"• เกณฑ์เข้าสัญญาณ: <code>{stars_desc}</code>")
     lines.append(
         f"• โควตารวมสูงสุด (Max × Size): <code>{fmt_num_clean(total_alloc_pct)}%</code> | "
-        f"ค่าเริ่มต้น .env: <code>{PAPER_MAX_OPEN_POSITIONS} ไม้ / {fmt_num_clean(PAPER_POSITION_PCT)}% / {fmt_num_clean(PAPER_LEVERAGE)}x / ≥{PAPER_MIN_STARS}⭐</code>"
+        f"ค่าเริ่มต้น .env: <code>{env_strat['short_tag']} | {PAPER_MAX_OPEN_POSITIONS} ไม้ / {fmt_num_clean(PAPER_POSITION_PCT)}% / {fmt_num_clean(PAPER_LEVERAGE)}x / ≥{PAPER_MIN_STARS}⭐</code>"
     )
 
     if eff_lev >= 20.0:
         lines.append("")
         lines.append(
-            f"⚠️ <b>คำเตือน Leverage สูง ({fmt_num_clean(eff_lev)}x):</b> ระบบวาง Stop Loss กว้างสุด ~4.8% "
+            f"⚠️ <b>คำเตือน Leverage สูง ({fmt_num_clean(eff_lev)}x):</b> กลยุทธ์ {html.escape(eff_strat['short_tag'])} วาง Stop Loss กว้างสุด ~{eff_strat['max_risk_pct']:.1f}% "
             "จึงเสี่ยงถูก <b>Liquidate ล้าง Margin ไม้นั้น (-100%)</b> ก่อนถึงจุด SL หากราคาสะบัดแรง"
         )
     if total_alloc_pct > 100.0:
@@ -1576,9 +2028,9 @@ def render_settings_html(st, notice_line=None):
     lines.append("")
     lines.append("🎛️ <b>กดปุ่มด้านล่าง (แถว: Max ไม้ → ขนาด% → Leverage → ดาว):</b>")
     lines.append(
-        "💡 <b>หรือพิมพ์ปรับค่าละเอียด:</b> <code>/set max 8 lev 15</code> · <code>/set size 12</code> · <code>/set stars 3</code> · <code>/set default</code>"
+        "💡 <b>หรือพิมพ์ปรับค่าละเอียด:</b> <code>/set strategy trend lev 15</code> · <code>/set max 8 size 12</code> · <code>/set stars 3</code> · <code>/set default</code>"
     )
-    lines.append("<i>หมายเหตุ: ไม้ที่ถืออยู่แล้วคง Margin/Lev เดิม — ค่าใหม่มีผลตั้งแต่ไม้ถัดไป</i>")
+    lines.append("<i>หมายเหตุ: ไม้ที่ถืออยู่แล้วคง Margin/Lev และแผน TP เดิม — ค่าใหม่มีผลตั้งแต่ไม้ถัดไป</i>")
 
     max_row = [
         {"text": (f"✅{m}ไม้" if eff_max == m else f"{m}ไม้"), "callback_data": f"paper:set:max:{m}"}
@@ -1596,11 +2048,14 @@ def render_settings_html(st, notice_line=None):
         {"text": ("✅ 2⭐ ขึ้นไป" if eff_stars == 2 else "2⭐ ขึ้นไป"), "callback_data": "paper:set:stars:2"},
         {"text": ("✅ เฉพาะ 3⭐ A+" if eff_stars == 3 else "เฉพาะ 3⭐ A+"), "callback_data": "paper:set:stars:3"},
     ]
-    footer_row = [
+    strat_footer_row = [
+        {"text": f"🎯 กลยุทธ์ ({eff_strat['short_tag']})", "callback_data": "paper:strategy"},
         {"text": "🔄 คืนค่าเริ่มต้น (.env)", "callback_data": "paper:cfg_default"},
+    ]
+    back_row = [
         {"text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh"},
     ]
-    return "\n".join(lines), [max_row, size_row, lev_row, stars_row, footer_row]
+    return "\n".join(lines), [max_row, size_row, lev_row, stars_row, strat_footer_row, back_row]
 
 
 def render_manage_html(st):
@@ -1616,8 +2071,10 @@ def render_manage_html(st):
         upnl = PaperTrader.pos_unrealized_pnl(p)
         uroe = PaperTrader.pos_unrealized_roe_pct(p)
         side_icon = "🟢" if p["side"] == "Long" else "🔴"
+        pos_strat = get_strategy(PaperTrader.pos_strategy(p))
         lines.append(
-            f"• #{p['id']} {side_icon} <b>{html.escape(p['symbol'])}</b> | ราคา <code>${fmt_price(p['last_price'])}</code> | uPnL <code>{upnl:+.2f} ({uroe:+.1f}%)</code>"
+            f"• #{p['id']} {side_icon} <b>{html.escape(p['symbol'])}</b> [{html.escape(pos_strat['short_tag'])}] | "
+            f"ราคา <code>${fmt_price(p['last_price'])}</code> | uPnL <code>{upnl:+.2f} ({uroe:+.1f}%)</code>"
         )
         rows.append([{"text": f"❌ ปิด #{p['id']} {p['symbol']} ({upnl:+.2f} USDT)", "callback_data": f"paper:close:{p['id']}"}])
     rows.append(
@@ -1647,8 +2104,15 @@ def render_history_html(rows):
         for r in rows:
             ts = r["timestamp"][11:19] if len(r["timestamp"]) >= 19 else r["timestamp"]
             icon = icon_map.get(r["event"], "📌")
+            raw_strat = r.get("strategy", "")
+            if raw_strat:
+                canon = normalize_strategy_key(raw_strat)
+                short = STRATEGIES[canon]["short_tag"] if canon else raw_strat
+                strat_badge = f" [{html.escape(short)}]"
+            else:
+                strat_badge = ""
             lines.append(
-                f"{icon} <code>{html.escape(ts)}</code> #{html.escape(str(r['trade_id']))} <b>{html.escape(r['symbol'])}</b> ({html.escape(r['side'])}) | "
+                f"{icon} <code>{html.escape(ts)}</code> #{html.escape(str(r['trade_id']))} <b>{html.escape(r['symbol'])}</b> ({html.escape(r['side'])}){strat_badge} | "
                 f"<code>{html.escape(r['event'])}</code> | ${fmt_price(r['exec_price'])} | <code>{r['net_pnl']:+.2f} USDT</code>"
             )
     kb = [
@@ -1685,7 +2149,7 @@ def render_reset_confirm_html():
     text = (
         "⚠️ <b>ยืนยันการรีเซ็ตพอร์ตจำลอง</b>\n\n"
         f"การรีเซ็ตจะล้างออเดอร์ที่ถืออยู่ทั้งหมด สถิติ Win Rate และไฟล์ประวัติเทรด CSV แล้วตั้งต้นใหม่เป็น <code>${PAPER_INITIAL_BALANCE:.2f} USDT</code> "
-        "<i>(ค่าตั้ง Max ไม้/Size/Lev ที่ปรับไว้จะยังคงเดิม)</i>\n"
+        "<i>(คงกลยุทธ์และค่าตั้ง Max ไม้/Size/Lev ที่ปรับไว้ — ล้างเฉพาะสถิติแยกกลยุทธ์)</i>\n"
         "ต้องการยืนยันหรือไม่?"
     )
     kb = [
@@ -1807,6 +2271,30 @@ class TelegramPaperBotController:
     def _handle_command(self, cmd, args=""):
         if cmd in ("/start", "/portfolio", "/status", "/positions"):
             self.send_dashboard_message(refresh_prices=True)
+        elif cmd in ("/strategy", "/strat", "/mode"):
+            if not args:
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_strategy_html(st)
+            else:
+                parsed = normalize_strategy_key(args)
+                if parsed:
+                    st = self.trader.set_strategy(parsed)
+                    strat = get_strategy(parsed)
+                    eff_stars = PaperTrader.state_effective_min_stars(st)
+                    notice = (
+                        f"🎯 เปลี่ยนกลยุทธ์เป็น {strat['title_th']} แล้ว — ปรับเกณฑ์เป็น ≥{eff_stars}⭐ อัตโนมัติ (คงค่า Lev/Size/Max เดิม)"
+                    )
+                    html_text, kb = render_strategy_html(st, notice_line=notice)
+                else:
+                    st = self.trader.get_state_snapshot()
+                    html_text, kb = render_strategy_html(
+                        st,
+                        notice_line=f"⚠️ ไม่รู้จักกลยุทธ์ `{args}` — เลือกได้: balanced, trend, breakout, reversal, scalp",
+                    )
+            try:
+                tg_send_html(html_text, kb)
+            except Exception:
+                pass
         elif cmd in ("/settings", "/config"):
             st = self.trader.get_state_snapshot()
             html_text, kb = render_settings_html(st)
@@ -1819,7 +2307,7 @@ class TelegramPaperBotController:
                 st = self.trader.get_state_snapshot()
                 html_text, kb = render_settings_html(
                     st,
-                    notice_line="💡 พิมพ์ค่าที่ต้องการต่อท้าย /set เช่น /set max 8 lev 15 หรือ /set default",
+                    notice_line="💡 พิมพ์ค่าที่ต้องการต่อท้าย /set เช่น /set max 8 lev 15 หรือ /set strategy trend หรือ /set default",
                 )
             else:
                 mode, payload = parse_set_command_args(args)
@@ -1827,9 +2315,21 @@ class TelegramPaperBotController:
                     st = self.trader.clear_runtime_settings()
                     html_text, kb = render_settings_html(st, notice_line="🔄 คืนค่าเริ่มต้นจากไฟล์ .env เรียบร้อยแล้ว")
                 elif mode == "update":
-                    st = self.trader.update_runtime_settings(**payload)
+                    strat_val = payload.get("strategy")
+                    if strat_val is not None:
+                        self.trader.set_strategy(strat_val)
+                    numeric_updates = {
+                        k: v
+                        for k, v in payload.items()
+                        if k != "strategy" and v is not None
+                    }
+                    if numeric_updates:
+                        st = self.trader.update_runtime_settings(**numeric_updates)
+                    else:
+                        st = self.trader.get_state_snapshot()
+                    eff_strat = get_strategy(PaperTrader.state_effective_strategy(st))
                     notice = (
-                        f"✅ บันทึกค่าใหม่แล้ว: Max {PaperTrader.state_effective_max_open_positions(st)} ไม้ | "
+                        f"✅ บันทึกค่าใหม่แล้ว: {eff_strat['short_tag']} | Max {PaperTrader.state_effective_max_open_positions(st)} ไม้ | "
                         f"ไม้ละ {fmt_num_clean(PaperTrader.state_effective_position_pct(st))}% | "
                         f"{fmt_num_clean(PaperTrader.state_effective_leverage(st))}x | "
                         f"≥ {PaperTrader.state_effective_min_stars(st)}⭐"
@@ -1892,8 +2392,9 @@ class TelegramPaperBotController:
             help_text = (
                 "🤖 <b>คำสั่งควบคุมพอร์ตจำลอง (Scanner-f)</b>\n"
                 "• /portfolio — ดูสรุปพอร์ตจำลอง + ปุ่มสั่งการ\n"
+                "• /strategy — เลือกกลยุทธ์ 5 แบบ + ดูสถิติ Win Rate/PnL แยกสาย\n"
                 "• /settings — เปิดหน้าตั้งค่า Max ไม้ / ขนาด% / Leverage / ดาว\n"
-                "• /set — ปรับค่าเอง เช่น <code>/set max 8 lev 15</code> หรือ <code>/set default</code>\n"
+                "• /set — ปรับค่าเอง เช่น <code>/set max 8 lev 15</code> หรือ <code>/set strategy trend</code> หรือ <code>/set default</code>\n"
                 "• /history — ดูประวัติการเทรด 10 รายการล่าสุด\n"
                 "• /scan — สแกนตลาด MTF ทันที 1 รอบ\n"
                 "• /pause — พักการเปิดออเดอร์ใหม่ชั่วคราว\n"
@@ -1904,6 +2405,7 @@ class TelegramPaperBotController:
             kb = [
                 [
                     {"text": "💼 เปิดพอร์ตจำลอง", "callback_data": "paper:panel"},
+                    {"text": "🎯 เลือกกลยุทธ์", "callback_data": "paper:strategy"},
                     {"text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings"},
                 ]
             ]
@@ -1927,6 +2429,26 @@ class TelegramPaperBotController:
                 st = self.trader.get_state_snapshot()
                 html_text, kb = render_dashboard_html(st)
                 tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data == "paper:strategy":
+                tg_answer_callback(cb_id, "🎯 เปิดหน้าเลือกกลยุทธ์ + สถิติแยกสาย")
+                st = self.trader.get_state_snapshot()
+                html_text, kb = render_strategy_html(st)
+                tg_edit_html(chat_id, msg_id, html_text, kb)
+            elif data.startswith("paper:strat:"):
+                raw_strat = data.split(":", 2)[2]
+                parsed = normalize_strategy_key(raw_strat)
+                if parsed:
+                    st = self.trader.set_strategy(parsed)
+                    strat = get_strategy(parsed)
+                    eff_stars = PaperTrader.state_effective_min_stars(st)
+                    tg_answer_callback(cb_id, f"🎯 ใช้กลยุทธ์ {strat['title_th']} (≥{eff_stars}⭐)")
+                    notice = (
+                        f"🎯 เปลี่ยนกลยุทธ์เป็น {strat['title_th']} แล้ว — ปรับเกณฑ์เป็น ≥{eff_stars}⭐ อัตโนมัติ (มีผลตั้งแต่สัญญาณถัดไป; คงค่า Lev/Size/Max เดิม)"
+                    )
+                    html_text, kb = render_strategy_html(st, notice_line=notice)
+                    tg_edit_html(chat_id, msg_id, html_text, kb)
+                else:
+                    tg_answer_callback(cb_id, "⚠️ ไม่พบกลยุทธ์ที่เลือก", show_alert=True)
             elif data == "paper:settings":
                 tg_answer_callback(cb_id, "⚙️ เปิดหน้าตั้งค่าพอร์ตจำลอง")
                 st = self.trader.get_state_snapshot()
@@ -2042,7 +2564,7 @@ class TelegramPaperBotController:
             elif data == "paper:reset_confirm":
                 st = self.trader.reset_portfolio()
                 tg_answer_callback(cb_id, "🔄 รีเซ็ตพอร์ตจำลองกลับเป็นทุนเริ่มต้นเรียบร้อย!")
-                html_text, kb = render_dashboard_html(st, notice_line="🔄 รีเซ็ตพอร์ตและล้างประวัติเรียบร้อยแล้ว (คงค่าตั้งขนาดไม้/Lev ที่ปรับไว้)")
+                html_text, kb = render_dashboard_html(st, notice_line="🔄 รีเซ็ตพอร์ตและล้างประวัติเรียบร้อยแล้ว (คงกลยุทธ์และค่าตั้งขนาดไม้/Lev ที่ปรับไว้)")
                 tg_edit_html(chat_id, msg_id, html_text, kb)
             elif data.startswith("paper:close:"):
                 try:
@@ -2093,6 +2615,7 @@ def dispatch_mtf_alert(
     reasons,
     extra_details=None,
     force=False,
+    strategy_key="BALANCED",
 ):
     now = time.time()
     cd_key = f"{symbol}:{category_key}"
@@ -2102,11 +2625,25 @@ def dispatch_mtf_alert(
             return None
         cooldown_cache[cd_key] = now
 
-    plan = build_mtf_trade_plan(direction, price, state_5m, state_15m, state_1h, aligned_1h)
+    strat = get_strategy(strategy_key)
+    plan = build_mtf_trade_plan(
+        direction,
+        price,
+        state_5m,
+        state_15m,
+        state_1h,
+        aligned_1h,
+        strategy_key=strat["key"],
+    )
+    strat_label = (
+        f"{strat['title_th']} (แบ่งปิด "
+        f"{strat['tp1_close_pct']:.0f}/{strat['tp2_close_pct']:.0f}/{strat['tp3_close_pct']:.0f}%)"
+    )
     ts_str = datetime.now().strftime("%H:%M:%S")
     reason_str = " + ".join(reasons) if reasons else "สัญญาณเทคนิคเข้าเงื่อนไข"
 
     print(f"\n🔔 [{ts_str}] {title_th} | {grade_str}")
+    print(f"   🎯 กลยุทธ์    : {strat_label}")
     print(f"   🪙 #{symbol} (Trigger: {trigger_tf}) | ราคา: ${fmt_price(price)} | 24h: {chg24:+.2f}% | Vol 24h: ${fmt_usd(vol24)}")
     print(f"   📌 สัญญาณหลัก : {summary}")
     print(f"   ✨ ความสอดคล้อง: {reason_str}")
@@ -2128,6 +2665,7 @@ def dispatch_mtf_alert(
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         lines = [
             f"<b>{html.escape(title_th)}</b>",
+            f"🎯 กลยุทธ์: <code>{html.escape(strat_label)}</code>",
             f"🏆 ระดับความแม่นยำ: <b>{html.escape(grade_str)}</b>",
             f"🪙 เหรียญ: <b>#{html.escape(symbol)}</b> (ราคา: <code>${fmt_price(price)}</code>)",
             f"📊 24h: <code>{chg24:+.2f}%</code> | 💧 Vol 24h: <code>${fmt_usd(vol24)}</code>",
@@ -2171,6 +2709,7 @@ def dispatch_mtf_alert(
     if DISCORD_WEBHOOK_URL:
         color = 0x00E676 if direction == "BULL" else (0xFF5252 if direction == "BEAR" else 0xFFB300)
         fields = [
+            {"name": "🎯 กลยุทธ์", "value": f"`{strat_label}`", "inline": False},
             {"name": "🏆 ความแม่นยำ", "value": f"**{grade_str}**", "inline": False},
             {"name": "🪙 เหรียญ", "value": f"**{symbol}** (`${fmt_price(price)}`)", "inline": True},
             {"name": "📊 24h / Vol", "value": f"`{chg24:+.2f}%` / `${fmt_usd(vol24)}`", "inline": True},
@@ -2354,17 +2893,30 @@ def detect_triggers_on_tf(candles, tf_name):
     return triggers
 
 
-def scan_symbol_mtf(symbol):
+def scan_symbol_mtf(symbol, active_strategy="BALANCED", eff_min_stars=None):
     """
-    สแกนเหรียญแบบ Two-Stage MTF:
-    1) ดึง 5m และ 15m (ใช้ Cache สำหรับ 15m ช่วง 120 วินาที) เพื่อตรวจหาสัญญาณตั้งต้น
-    2) หากมีสัญญาณตั้งต้น จึงดึง/เช็ค 1h (Cache 300 วินาที) เพื่อประเมิน Confluence ครบ 3 TF (5m + 15m + 1h)
+    สแกนเหรียญแบบ Two-Stage MTF ตามกลยุทธ์ที่เลือก:
+    1) ดึง 5m และ 15m (ใช้ Cache สำหรับ 15m ช่วง 120 วินาที) แล้วกรองเฉพาะสัญญาณที่กลยุทธ์อนุญาต
+    2) หากมีสัญญาณที่ผ่านเกณฑ์ จึงดึง/เช็ค 1h (Cache 300 วินาที) เพื่อประเมิน Confluence ครบ 3 TF (5m + 15m + 1h)
     """
+    strat = get_strategy(active_strategy)
+    min_stars_req = (
+        max(1, min(3, int(eff_min_stars)))
+        if eff_min_stars is not None
+        else strategy_default_min_stars(strat["key"])
+    )
+
     candles_5m = fetch_klines(symbol, "5m", CANDLE_LIMIT)
-    triggers_5m = detect_triggers_on_tf(candles_5m, "5m")
+    triggers_5m = [
+        t for t in detect_triggers_on_tf(candles_5m, "5m")
+        if strategy_allows_category(strat["key"], t[0])
+    ]
 
     candles_15m = get_cached_klines(symbol, "15m", ttl_secs=120)
-    triggers_15m = detect_triggers_on_tf(candles_15m, "15m")
+    triggers_15m = [
+        t for t in detect_triggers_on_tf(candles_15m, "15m")
+        if strategy_allows_category(strat["key"], t[0])
+    ]
 
     if not triggers_5m and not triggers_15m:
         return symbol, []
@@ -2387,7 +2939,8 @@ def scan_symbol_mtf(symbol):
         stars, grade_str, aligned_1h, reasons = evaluate_mtf_confluence(
             direction, is_reversal, state_5m, state_15m, state_1h
         )
-        if stars >= MIN_STARS:
+        passes_1h = (not strat["require_1h_align"]) or aligned_1h
+        if stars >= min_stars_req and passes_1h:
             seen_categories.add(cat_key)
             confirmed_results.append(
                 {
@@ -2443,15 +2996,22 @@ def scan_once():
     # อัปเดตราคาปัจจุบันของออเดอร์จำลองที่เปิดค้างอยู่ทั้งหมดก่อนสแกนรอบใหม่
     paper_trader.update_prices(all_price_map)
 
+    eff_strat_key, eff_stars = paper_trader.get_effective_strategy_and_min_stars()
+    eff_strat = get_strategy(eff_strat_key)
+
     qualified.sort(reverse=True)
     symbols = [sym for _, sym in qualified[:MAX_SYMBOLS]]
-    print(f"✅ คัดกรองเหรียญ Volume >= ${fmt_usd(MIN_QUOTE_VOL_24H)} ได้ {len(symbols)} เหรียญ (แจ้งเตือนเฉพาะ >= {MIN_STARS} ดาว ⭐⭐)")
+    lock_note = " | บังคับตามเทรนด์ 1h" if eff_strat["require_1h_align"] else ""
+    print(
+        f"✅ คัดกรองเหรียญ Volume >= ${fmt_usd(MIN_QUOTE_VOL_24H)} ได้ {len(symbols)} เหรียญ | "
+        f"[กลยุทธ์: {eff_strat['title_th']}] (แจ้งเตือนเฉพาะ >= {eff_stars} ดาว{lock_note})"
+    )
 
     signal_total = 0
 
-    # 1. สแกน MTF (5m + 15m + 1h) แบบขนาน
+    # 1. สแกน MTF (5m + 15m + 1h) แบบขนานตามกลยุทธ์ปัจจุบัน
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(scan_symbol_mtf, sym) for sym in symbols]
+        futures = [pool.submit(scan_symbol_mtf, sym, eff_strat_key, eff_stars) for sym in symbols]
         for fut in concurrent.futures.as_completed(futures):
             try:
                 sym, results = fut.result()
@@ -2482,6 +3042,7 @@ def scan_once():
                     item["grade_str"],
                     item["aligned_1h"],
                     item["reasons"],
+                    strategy_key=eff_strat_key,
                 )
                 if plan:
                     paper_trader.try_open_position(
@@ -2493,16 +3054,22 @@ def scan_once():
                         plan,
                     )
 
-    # 2. สแกน Funding Rate ผิดปกติ พร้อมดึง 5m+15m+1h มาวางแผนเทรด
-    try:
-        prem_list = http_get_json(f"{FAPI_URL}/fapi/v1/premiumIndex")
-        active_set = set(symbols)
-        for item in prem_list:
-            sym = item.get("symbol")
-            if sym not in active_set:
-                continue
-            fr_pct = float(item.get("lastFundingRate", 0.0)) * 100.0
-            if abs(fr_pct) >= FUNDING_THRESHOLD_PCT:
+    # 2. สแกน Funding Rate ผิดปกติ (เฉพาะเมื่อกลยุทธ์ปัจจุบันอนุญาตสัญญาณ FUNDING)
+    if strategy_allows_category(eff_strat_key, "FUNDING"):
+        try:
+            prem_list = http_get_json(f"{FAPI_URL}/fapi/v1/premiumIndex")
+            active_set = set(symbols)
+            now_ts = time.time()
+            for item in prem_list:
+                sym = item.get("symbol")
+                if sym not in active_set:
+                    continue
+                fr_pct = float(item.get("lastFundingRate", 0.0)) * 100.0
+                if abs(fr_pct) < FUNDING_THRESHOLD_PCT:
+                    continue
+                # เช็ค Cooldown ก่อนดึงแท่งเทียน 5m/15m/1h เพื่อประหยัดเน็ตบนมือถือ
+                if now_ts - cooldown_cache.get(f"{sym}:FUNDING", 0) < ALERT_COOLDOWN_SECS:
+                    continue
                 meta = ticker_map[sym]
                 direction = "BULL" if fr_pct < 0 else "BEAR"
                 note = "Short จ่าย Long (ระวัง Short Squeeze)" if fr_pct < 0 else "Long จ่าย Short (Long หนาแน่น)"
@@ -2512,6 +3079,9 @@ def scan_once():
                 s5, s15, s1h = analyze_tf_state(c5), analyze_tf_state(c15), analyze_tf_state(c1h)
                 if s5 and s15 and s1h:
                     stars, grade_str, aligned_1h, reasons = evaluate_mtf_confluence(direction, True, s5, s15, s1h)
+                    passes_1h = (not eff_strat["require_1h_align"]) or aligned_1h
+                    if stars < eff_stars or not passes_1h:
+                        continue
                     reasons.insert(0, f"Funding Rate สุดขั้ว ({fr_pct:+.4f}%)")
                     signal_total += 1
                     mark_price = float(item.get("markPrice", meta["price"]))
@@ -2531,6 +3101,7 @@ def scan_once():
                         grade_str,
                         aligned_1h,
                         reasons,
+                        strategy_key=eff_strat_key,
                     )
                     if plan:
                         paper_trader.try_open_position(
@@ -2541,16 +3112,16 @@ def scan_once():
                             stars,
                             plan,
                         )
-    except Exception as e:
-        print(f"⚠️ ดึงข้อมูล Funding Rate ไม่สำเร็จ: {e}")
+        except Exception as e:
+            print(f"⚠️ ดึงข้อมูล Funding Rate ไม่สำเร็จ: {e}")
 
-    print(f"🏁 จบรอบสแกน MTF: พบสัญญาณคุณภาพ (⭐⭐ ขึ้นไป) จำนวน {signal_total} รายการ")
+    print(f"🏁 จบรอบสแกน MTF [{eff_strat['short_tag']}]: พบสัญญาณคุณภาพ (>= {eff_stars} ดาว) จำนวน {signal_total} รายการ")
     if PAPER_TRADING_ENABLED:
         paper_trader.print_portfolio_summary()
 
 
 def run_paper_self_test():
-    """ทดสอบระบบจำลองการเทรดในไฟล์ชั่วคราว (/tmp) เพื่อให้มั่นใจว่าคำนวณ TP1/TP2/TP3/SL/BE ถูกต้อง"""
+    """ทดสอบระบบจำลองการเทรดในไฟล์ชั่วคราว (/tmp) เพื่อให้มั่นใจว่าคำนวณ TP1/TP2/TP3/SL/BE และระบบกลยุทธ์ถูกต้อง"""
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2628,7 +3199,10 @@ def run_paper_self_test():
         dash_html, dash_kb = render_dashboard_html(pt.get_state_snapshot(), notice_line="ทดสอบ <แจ้งเตือน> & ปุ่ม")
         assert "&lt;แจ้งเตือน&gt;" in dash_html
         assert "ADA&amp;TEST&lt;1&gt;" in dash_html
-        assert len(dash_kb) == 4  # Open position active -> Manage & Close All row appears
+        assert len(dash_kb) == 5  # Manage/CloseAll + Strategy/Settings + Reset rows
+        assert dash_kb[3][0]["callback_data"] == "paper:strategy"
+        assert dash_kb[3][1]["callback_data"] == "paper:settings"
+        assert dash_kb[4][0]["callback_data"] == "paper:reset_prompt"
 
         manage_html, manage_kb = render_manage_html(pt.get_state_snapshot())
         assert "ADA&amp;TEST&lt;1&gt;" in manage_html
@@ -2707,7 +3281,209 @@ def run_paper_self_test():
         assert PaperTrader.state_has_custom_settings(st_default) is False
         assert PaperTrader.state_effective_max_open_positions(st_default) == PAPER_MAX_OPEN_POSITIONS
 
-        print("✅ ทดสอบตรรกะระบบจำลองการเทรด + Telegram Dashboard & Settings Self-Test (5 กรณี) ผ่าน 100%!")
+        # 6) Trading Strategy Presets, Signal Filters, Custom Splits (25/35/40 & 50/35/15),
+        #    Per-Position Strategy Snapshot, Live Switch, Manual Min-Stars Override & Strategy Stats
+        assert normalize_strategy_key("trend") == "TREND_FOLLOW"
+        assert normalize_strategy_key("Reversal-Sniper") == "REVERSAL_SNIPER"
+        assert normalize_strategy_key("scalp") == "SCALP_QUICK"
+        assert normalize_strategy_key("ตามเทรนด์") == "TREND_FOLLOW"
+        assert normalize_strategy_key("unknown_mode") is None
+
+        # Signal category filter parity (Python & Rust category keys)
+        assert strategy_allows_category("BALANCED", "FUNDING") is True
+        assert strategy_allows_category("TREND_FOLLOW", "EMA_BULL") is True
+        assert strategy_allows_category("TREND_FOLLOW", "EMA_BULL_CROSS") is True
+        assert strategy_allows_category("TREND_FOLLOW", "RSI_OS") is False
+        assert strategy_allows_category("TREND_FOLLOW", "FUNDING") is False
+        assert strategy_allows_category("BREAKOUT", "PUMP") is True
+        assert strategy_allows_category("BREAKOUT", "OI_SPIKE") is True
+        assert strategy_allows_category("BREAKOUT", "RSI_OB") is False
+        assert strategy_allows_category("REVERSAL_SNIPER", "RSI_OS") is True
+        assert strategy_allows_category("REVERSAL_SNIPER", "FUNDING") is True
+        assert strategy_allows_category("REVERSAL_SNIPER", "PUMP") is False
+        assert strategy_allows_category("SCALP_QUICK", "PUMP") is True
+        assert strategy_allows_category("SCALP_QUICK", "FUNDING") is False
+
+        # build_mtf_trade_plan differs cleanly by strategy
+        s5 = {"atr": 2.0, "label": "Bull", "vol_ratio": 2.0, "candles": []}
+        s15 = {"atr": 4.0, "label": "Bull", "vol_ratio": 1.8, "candles": []}
+        s1h = {"atr": 8.0, "label": "Bull", "vol_ratio": 1.5, "candles": []}
+        plan_scalp = build_mtf_trade_plan("BULL", 100.0, s5, s15, s1h, True, strategy_key="SCALP_QUICK")
+        plan_trend = build_mtf_trade_plan("BULL", 100.0, s5, s15, s1h, True, strategy_key="TREND_FOLLOW")
+        assert plan_scalp is not None and plan_trend is not None
+        assert plan_scalp["risk_pct"] <= 2.80 + 1e-6  # SCALP_QUICK capped at 2.80%
+        assert plan_trend["tp3"] > plan_scalp["tp3"]
+        assert plan_trend["tp1"] < plan_trend["tp2"] < plan_trend["tp3"]
+        assert abs(plan_trend["tp1_close_pct"] - 25.0) < 1e-6
+        assert abs(plan_trend["tp2_close_pct"] - 35.0) < 1e-6
+        assert abs(plan_scalp["tp1_close_pct"] - 50.0) < 1e-6
+
+        # Switch to TREND_FOLLOW -> auto sets min_stars=3 while preserving lev/size/max
+        pt2 = PaperTrader(
+            state_file=os.path.join(tmpdir, "state_strat.json"),
+            csv_file=os.path.join(tmpdir, "trades_strat.csv"),
+        )
+        pt2.update_runtime_settings(max_open_positions=8, position_pct=20.0, leverage=20.0, min_stars=2)
+        st_trend = pt2.set_strategy("TREND_FOLLOW")
+        assert PaperTrader.state_effective_strategy(st_trend) == "TREND_FOLLOW"
+        assert PaperTrader.state_effective_min_stars(st_trend) == 3
+        assert PaperTrader.state_effective_max_open_positions(st_trend) == 8
+        assert abs(PaperTrader.state_effective_position_pct(st_trend) - 20.0) < 1e-6
+        assert abs(PaperTrader.state_effective_leverage(st_trend) - 20.0) < 1e-6
+
+        # Open TREND_FOLLOW position (25/35/40 splits), then switch live to SCALP_QUICK before TP hits!
+        trend_pos_plan = {
+            "entry_price": 100.0,
+            "sl": 98.0,
+            "tp1": 102.0,
+            "tp2": 104.0,
+            "tp3": 106.0,
+            "risk_pct": 2.0,
+        }
+        tid_tr = pt2.try_open_position("BTCUSDT", "BULL", "EMA_BULL", "5m+15m+1h", 3, trend_pos_plan, notify=False)
+        assert tid_tr == 1
+        assert pt2.state["open_positions"][0]["strategy"] == "TREND_FOLLOW"
+        assert abs(pt2.state["open_positions"][0]["tp1_close_pct"] - 25.0) < 1e-6
+        assert abs(pt2.state["open_positions"][0]["tp2_close_pct"] - 35.0) < 1e-6
+
+        # Live switch to SCALP_QUICK (default MinStars=2, 50/35/15)
+        st_scalp = pt2.set_strategy("SCALP_QUICK")
+        assert PaperTrader.state_effective_strategy(st_scalp) == "SCALP_QUICK"
+        assert PaperTrader.state_effective_min_stars(st_scalp) == 2
+
+        # Open new position under SCALP_QUICK while old TREND_FOLLOW is still open
+        scalp_pos_plan = {
+            "entry_price": 100.0,
+            "sl": 98.5,
+            "tp1": 101.5,
+            "tp2": 103.0,
+            "tp3": 104.5,
+            "risk_pct": 1.5,
+        }
+        tid_sc = pt2.try_open_position("ETHUSDT", "BULL", "PUMP", "5m+15m+1h", 2, scalp_pos_plan, notify=False)
+        assert tid_sc == 2
+
+        # Hit TP1 on BTCUSDT -> must still close 25% (remaining_fraction = 0.75) & keep TREND_FOLLOW tag
+        pt2.update_prices({"BTCUSDT": 102.0}, notify=False)
+        btc_pos = next(p for p in pt2.state["open_positions"] if p["id"] == tid_tr)
+        assert btc_pos["tp1_hit"] is True
+        assert abs(btc_pos["remaining_fraction"] - 0.75) < 1e-6
+        assert PaperTrader.pos_strategy(btc_pos) == "TREND_FOLLOW"
+
+        # Hit TP2 -> closes 35% (remaining_fraction = 0.40) -> Hit TP3 -> closes 40%
+        pt2.update_prices({"BTCUSDT": 104.0}, notify=False)
+        btc_pos = next(p for p in pt2.state["open_positions"] if p["id"] == tid_tr)
+        assert btc_pos["tp2_hit"] is True
+        assert abs(btc_pos["remaining_fraction"] - 0.40) < 1e-6
+        pt2.update_prices({"BTCUSDT": 106.0}, notify=False)
+        assert all(p["id"] != tid_tr for p in pt2.state["open_positions"])
+
+        # ETHUSDT (SCALP_QUICK) hits TP1 -> closes 50% (remaining_fraction = 0.50), then manual close
+        pt2.update_prices({"ETHUSDT": 101.5}, notify=False)
+        eth_pos = next(p for p in pt2.state["open_positions"] if p["id"] == tid_sc)
+        assert abs(eth_pos["remaining_fraction"] - 0.50) < 1e-6
+        pt2.close_position_by_id(tid_sc, market_prices={"ETHUSDT": 102.0}, notify=False)
+
+        # Verify strategy_stats accumulated accurately
+        snap2 = pt2.get_state_snapshot()
+        assert snap2["strategy_stats"]["TREND_FOLLOW"]["trades"] == 1
+        assert snap2["strategy_stats"]["TREND_FOLLOW"]["wins"] == 1
+        assert snap2["strategy_stats"]["SCALP_QUICK"]["trades"] == 1
+        assert snap2["strategy_stats"]["SCALP_QUICK"]["wins"] == 1
+
+        # Render Strategy HTML & History HTML with 20-col CSV strategy tags
+        strat_html, strat_kb = render_strategy_html(snap2, notice_line="สลับกลยุทธ์สำเร็จ")
+        assert "สถิติ Win Rate / PnL แยกตามกลยุทธ์" in strat_html
+        assert "Trend:" in strat_html and "Scalp:" in strat_html
+        assert any(btn["callback_data"] == "paper:strat:TREND_FOLLOW" for row in strat_kb for btn in row)
+        assert any("✅" in btn["text"] and btn["callback_data"] == "paper:strat:SCALP_QUICK" for row in strat_kb for btn in row)
+
+        csv_rows2 = pt2.recent_csv_events(10)
+        assert any(r["strategy"] == "TREND_FOLLOW" for r in csv_rows2)
+        assert any(r["strategy"] == "SCALP_QUICK" for r in csv_rows2)
+        with open(os.path.join(tmpdir, "trades_strat.csv"), "r", encoding="utf-8") as cf:
+            header_cols = cf.readline().strip().split(",")
+            assert len(header_cols) == 20 and header_cols[19] == "strategy"
+        hist2_html, _ = render_history_html(csv_rows2)
+        assert "[Trend]" in hist2_html and "[Scalp]" in hist2_html
+
+        # Manual min_stars override on SCALP_QUICK, then switching to BREAKOUT resets custom_min_stars -> 2
+        st_manual_stars = pt2.update_runtime_settings(min_stars=3)
+        assert PaperTrader.state_effective_min_stars(st_manual_stars) == 3
+        st_breakout = pt2.set_strategy("BREAKOUT")
+        assert st_breakout["custom_min_stars"] is None
+        assert PaperTrader.state_effective_min_stars(st_breakout) == 2
+
+        # /set strategy parser check
+        mode_s, vals_s = parse_set_command_args("strategy trend lev 15 stars 2")
+        assert mode_s == "update"
+        assert vals_s["strategy"] == "TREND_FOLLOW"
+        assert abs(vals_s["leverage"] - 15.0) < 1e-6
+        assert vals_s["min_stars"] == 2
+        assert parse_set_command_args("strategy invalid_name")[0] == "error"
+
+        # reset_portfolio keeps custom_strategy & numeric settings, clears strategy_stats
+        st_rst2 = pt2.reset_portfolio()
+        assert PaperTrader.state_effective_strategy(st_rst2) == "BREAKOUT"
+        assert st_rst2["strategy_stats"] == {}
+
+        # Legacy state JSON without custom_strategy/strategy_stats/position strategy/tp splits loads safely
+        legacy_path = os.path.join(tmpdir, "legacy_state.json")
+        legacy_payload = {
+            "initial_balance": 1000.0,
+            "free_balance": 900.0,
+            "realized_pnl": 0.0,
+            "total_fees": 0.5,
+            "peak_equity": 1000.0,
+            "max_drawdown_pct": 0.0,
+            "next_trade_id": 2,
+            "total_closed": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "open_positions": [
+                {
+                    "id": 1,
+                    "symbol": "BTCUSDT",
+                    "side": "Long",
+                    "stars": 2,
+                    "signal_category": "RSI_OS",
+                    "timeframe": "5m+15m+1h",
+                    "entry_price": 100.0,
+                    "initial_sl": 98.0,
+                    "current_sl": 98.0,
+                    "tp1": 102.0,
+                    "tp2": 104.0,
+                    "tp3": 106.0,
+                    "leverage": 10.0,
+                    "initial_margin": 100.0,
+                    "remaining_margin": 100.0,
+                    "initial_qty": 10.0,
+                    "remaining_qty": 10.0,
+                    "remaining_fraction": 1.0,
+                    "tp1_hit": False,
+                    "tp2_hit": False,
+                    "realized_pnl_trade": -0.5,
+                    "fees_paid_trade": 0.5,
+                    "last_price": 100.0,
+                    "opened_at": "2026-01-01T00:00:00Z",
+                }
+            ],
+        }
+        with open(legacy_path, "w", encoding="utf-8") as lf:
+            json.dump(legacy_payload, lf)
+        pt_legacy = PaperTrader(state_file=legacy_path, csv_file=os.path.join(tmpdir, "legacy.csv"))
+        legacy_snap = pt_legacy.get_state_snapshot()
+        assert PaperTrader.state_effective_strategy(legacy_snap) == SCANNER_STRATEGY
+        assert PaperTrader.pos_strategy(legacy_snap["open_positions"][0]) == "BALANCED"
+        assert PaperTrader.pos_tp_close_splits(legacy_snap["open_positions"][0]) == (40.0, 30.0, 30.0)
+        assert legacy_snap["strategy_stats"] == {}
+
+        # clear_runtime_settings reverts custom_strategy to None
+        st_clr = pt2.clear_runtime_settings()
+        assert st_clr["custom_strategy"] is None
+        assert PaperTrader.state_effective_strategy(st_clr) == SCANNER_STRATEGY
+
+        print("✅ ทดสอบตรรกะระบบจำลองการเทรด + กลยุทธ์ 5 แบบ & Telegram Dashboard Self-Test (6 กรณี) ผ่าน 100%!")
 
 
 def main():
@@ -2716,13 +3492,22 @@ def main():
         if telegram_bot.is_enabled()
         else ("เปิด ✅ (แจ้งเตือนอย่างเดียว)" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "ไม่ได้ตั้งค่า ⚪")
     )
+    eff_strat_key, eff_stars = paper_trader.get_effective_strategy_and_min_stars()
+    eff_strat = get_strategy(eff_strat_key)
+    env_strat = get_strategy(SCANNER_STRATEGY)
+    snap = paper_trader.get_state_snapshot()
+    eff_lev = PaperTrader.state_effective_leverage(snap)
+    eff_pct = PaperTrader.state_effective_position_pct(snap)
+    eff_max = PaperTrader.state_effective_max_open_positions(snap)
+
     print("==============================================================")
     print("📱 Scanner-f (MTF Edition: 5m + 15m + 1h) — Binance Futures")
     print("• ชุดวิเคราะห์ : 5m (จุดเข้า) + 15m (โมเมนตัม/SL) + 1h (เทรนด์หลัก/TP3)")
-    print(f"• เกณฑ์คัดกรอง : 24h Vol >= ${fmt_usd(MIN_QUOTE_VOL_24H)} | คัดเฉพาะ >= {MIN_STARS} ดาว (⭐⭐/⭐⭐⭐)")
+    print(f"• กลยุทธ์ที่ใช้งาน : {eff_strat['title_th']} | เกณฑ์คัดกรอง: >= {eff_stars} ดาว | Vol >= ${fmt_usd(MIN_QUOTE_VOL_24H)}")
+    print(f"• กลยุทธ์เริ่มต้น (.env): {env_strat['title_th']} (สลับสดผ่าน /strategy ใน Telegram)")
     print(
         f"• จำลองการเทรด : {'เปิด ✅' if PAPER_TRADING_ENABLED else 'ปิด ⚪'} | ทุน ${PAPER_INITIAL_BALANCE:.0f} | "
-        f"{PAPER_LEVERAGE:.0f}x | ไม้ละ {PAPER_POSITION_PCT:.0f}% | Max {PAPER_MAX_OPEN_POSITIONS} ไม้"
+        f"{fmt_num_clean(eff_lev)}x | ไม้ละ {fmt_num_clean(eff_pct)}% | Max {eff_max} ไม้"
     )
     print(f"• แจ้งเตือน   : Telegram={tg_bot_txt} | Discord={'เปิด ✅' if DISCORD_WEBHOOK_URL else 'ไม่ได้ตั้งค่า ⚪'}")
     print("==============================================================")
@@ -2772,6 +3557,7 @@ def main():
             True,
             ["15m เข้าเขต Oversold ร่วมด้วย (RSI 27.2)", "ตามเทรนด์ใหญ่ 1h (ขาขึ้น)"],
             force=True,
+            strategy_key=eff_strat_key,
         )
         telegram_bot.send_dashboard_message(
             refresh_prices=False,

@@ -437,20 +437,23 @@ pub struct MtfTradeLevels {
     pub tp3_pct: f64,
 }
 
-/// Computes Entry, SL (15m structure), and TP1/TP2/TP3 (5m/15m/1h) levels.
-pub fn compute_mtf_trade_levels(
+/// Computes Entry, SL (15m structure), and TP1/TP2/TP3 levels tuned for the given TradingStrategy.
+pub fn compute_mtf_trade_levels_for_strategy(
     direction: crate::models::SignalDirection,
     price: f64,
     state_5m: &TimeframeState,
     state_15m: &TimeframeState,
     state_1h: &TimeframeState,
     candles_15m: &[Candle],
+    strategy: crate::strategy::TradingStrategy,
 ) -> Option<MtfTradeLevels> {
     use crate::models::SignalDirection;
 
     if price <= 0.0 || direction == SignalDirection::Neutral {
         return None;
     }
+
+    let profile = strategy.trade_profile();
 
     let atr_5m = if state_5m.atr > 0.0 {
         state_5m.atr
@@ -468,7 +471,7 @@ pub fn compute_mtf_trade_levels(
         price * 0.024
     };
 
-    let mut raw_risk = atr_15m * 1.4;
+    let mut raw_risk = atr_15m * profile.atr15_mult;
     if candles_15m.len() >= 6 {
         let start = candles_15m.len().saturating_sub(8);
         let recent_15m = &candles_15m[start..];
@@ -501,14 +504,18 @@ pub fn compute_mtf_trade_levels(
         }
     }
 
-    let min_risk = price * 0.007;
-    let max_risk = price * 0.048;
+    let min_risk = price * (profile.min_risk_pct / 100.0);
+    let max_risk = price * (profile.max_risk_pct / 100.0);
     let risk = raw_risk.clamp(min_risk, max_risk);
     let risk_pct = (risk / price) * 100.0;
 
-    let tp1_dist = (risk * 1.3).max(atr_5m * 2.2);
-    let tp2_dist = (risk * 2.3).max(atr_15m * 2.2);
-    let tp3_dist = (risk * 3.6).max(atr_1h * 1.8);
+    let tp1_dist = (risk * profile.tp1_r).max(atr_5m * profile.tp1_atr5_mult);
+    let tp2_dist = (risk * profile.tp2_r)
+        .max(atr_15m * profile.tp2_atr15_mult)
+        .max(tp1_dist * 1.25);
+    let tp3_dist = (risk * profile.tp3_r)
+        .max(atr_1h * profile.tp3_atr1h_mult)
+        .max(tp2_dist * 1.25);
 
     let tp1_pct = (tp1_dist / price) * 100.0;
     let tp2_pct = (tp2_dist / price) * 100.0;
@@ -543,6 +550,26 @@ pub fn compute_mtf_trade_levels(
     }
 }
 
+/// Computes Entry, SL (15m structure), and TP1/TP2/TP3 (5m/15m/1h) levels using Balanced defaults.
+pub fn compute_mtf_trade_levels(
+    direction: crate::models::SignalDirection,
+    price: f64,
+    state_5m: &TimeframeState,
+    state_15m: &TimeframeState,
+    state_1h: &TimeframeState,
+    candles_15m: &[Candle],
+) -> Option<MtfTradeLevels> {
+    compute_mtf_trade_levels_for_strategy(
+        direction,
+        price,
+        state_5m,
+        state_15m,
+        state_1h,
+        candles_15m,
+        crate::strategy::TradingStrategy::Balanced,
+    )
+}
+
 /// Appends Multi-Timeframe Summary + Entry (5m), SL (15m structure), and TP1/TP2/TP3 (5m/15m/1h) to signal details.
 #[allow(clippy::too_many_arguments)]
 pub fn append_mtf_trade_plan(
@@ -556,19 +583,32 @@ pub fn append_mtf_trade_plan(
     grade_str: &str,
     aligned_1h: bool,
     reasons: &[String],
+    strategy: crate::strategy::TradingStrategy,
 ) -> Option<MtfTradeLevels> {
     use crate::models::SignalDirection;
     use crate::notifier::format_price;
 
-    let levels = compute_mtf_trade_levels(
+    let levels = compute_mtf_trade_levels_for_strategy(
         direction,
         price,
         state_5m,
         state_15m,
         state_1h,
         candles_15m,
+        strategy,
     )?;
+    let profile = strategy.trade_profile();
 
+    details.push((
+        "🎯 กลยุทธ์".to_string(),
+        format!(
+            "{} (ปิดแบ่ง {:.0}%/{:.0}%/{:.0}%)",
+            strategy.title_th(),
+            profile.tp1_close_pct,
+            profile.tp2_close_pct,
+            profile.tp3_close_pct
+        ),
+    ));
     details.push(("🏆 ความแม่นยำ".to_string(), grade_str.to_string()));
     if !reasons.is_empty() {
         details.push(("✨ เหตุผลหนุน".to_string(), reasons.join(" + ")));
@@ -600,31 +640,34 @@ pub fn append_mtf_trade_plan(
             details.push((
                 "💰 เป้าทำกำไร TP1".to_string(),
                 format!(
-                    "${} (+{:.2}%) [เป้าสั้น 5m]",
+                    "${} (+{:.2}%) [ปิด {:.0}% | เป้าสั้น]",
                     format_price(levels.tp1),
-                    levels.tp1_pct
+                    levels.tp1_pct,
+                    profile.tp1_close_pct
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP2".to_string(),
                 format!(
-                    "${} (+{:.2}%) [เป้ากลาง 15m]",
+                    "${} (+{:.2}%) [ปิด {:.0}% | เป้ากลาง]",
                     format_price(levels.tp2),
-                    levels.tp2_pct
+                    levels.tp2_pct,
+                    profile.tp2_close_pct
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP3".to_string(),
                 format!(
-                    "${} (+{:.2}%) [เป้ารันเทรนด์ 1h]",
+                    "${} (+{:.2}%) [ปิด {:.0}% | เป้าไกล]",
                     format_price(levels.tp3),
-                    levels.tp3_pct
+                    levels.tp3_pct,
+                    profile.tp3_close_pct
                 ),
             ));
             details.push((
                 "🛡️ ตัดขาดทุน (SL)".to_string(),
                 format!(
-                    "${} (-{:.2}%) [ใต้ฐาน 15m]",
+                    "${} (-{:.2}%) [ฐาน 15m]",
                     format_price(levels.sl),
                     levels.risk_pct
                 ),
@@ -646,31 +689,34 @@ pub fn append_mtf_trade_plan(
             details.push((
                 "💰 เป้าทำกำไร TP1".to_string(),
                 format!(
-                    "${} (+{:.2}%) [เป้าสั้น 5m]",
+                    "${} (+{:.2}%) [ปิด {:.0}% | เป้าสั้น]",
                     format_price(levels.tp1),
-                    levels.tp1_pct
+                    levels.tp1_pct,
+                    profile.tp1_close_pct
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP2".to_string(),
                 format!(
-                    "${} (+{:.2}%) [เป้ากลาง 15m]",
+                    "${} (+{:.2}%) [ปิด {:.0}% | เป้ากลาง]",
                     format_price(levels.tp2),
-                    levels.tp2_pct
+                    levels.tp2_pct,
+                    profile.tp2_close_pct
                 ),
             ));
             details.push((
                 "💰 เป้าทำกำไร TP3".to_string(),
                 format!(
-                    "${} (+{:.2}%) [เป้ารันเทรนด์ 1h]",
+                    "${} (+{:.2}%) [ปิด {:.0}% | เป้าไกล]",
                     format_price(levels.tp3),
-                    levels.tp3_pct
+                    levels.tp3_pct,
+                    profile.tp3_close_pct
                 ),
             ));
             details.push((
                 "🛡️ ตัดขาดทุน (SL)".to_string(),
                 format!(
-                    "${} (-{:.2}%) [เหนือต้าน 15m]",
+                    "${} (-{:.2}%) [ต้าน 15m]",
                     format_price(levels.sl),
                     levels.risk_pct
                 ),
@@ -853,5 +899,53 @@ mod tests {
         assert!(bb.upper > bb.middle);
         assert!(bb.middle > bb.lower);
         assert!(bb.bandwidth_pct > 0.0);
+    }
+
+    #[test]
+    fn test_strategy_mtf_trade_levels_scaling() {
+        use crate::models::SignalDirection;
+        use crate::strategy::TradingStrategy;
+
+        let make_state = |atr: f64| TimeframeState {
+            trend: SignalDirection::Bullish,
+            rsi: 55.0,
+            ema9: 101.0,
+            ema21: 100.0,
+            ema50: 99.0,
+            vol_ratio: 1.5,
+            atr,
+            label: "BULL".to_string(),
+        };
+
+        let s5 = make_state(0.5);
+        let s15 = make_state(5.0); // large ATR to hit max_risk cap
+        let s1h = make_state(2.0);
+
+        let scalp = compute_mtf_trade_levels_for_strategy(
+            SignalDirection::Bullish,
+            100.0,
+            &s5,
+            &s15,
+            &s1h,
+            &[],
+            TradingStrategy::ScalpQuick,
+        )
+        .unwrap();
+        let trend = compute_mtf_trade_levels_for_strategy(
+            SignalDirection::Bullish,
+            100.0,
+            &s5,
+            &s15,
+            &s1h,
+            &[],
+            TradingStrategy::TrendFollow,
+        )
+        .unwrap();
+
+        assert!(scalp.risk_pct <= 2.81);
+        assert!(trend.risk_pct > scalp.risk_pct);
+        assert!(scalp.tp1 < scalp.tp2 && scalp.tp2 < scalp.tp3);
+        assert!(trend.tp1 < trend.tp2 && trend.tp2 < trend.tp3);
+        assert!(trend.tp3 > scalp.tp3);
     }
 }

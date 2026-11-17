@@ -10,6 +10,7 @@ use crate::binance::BinanceFuturesClient;
 use crate::config::ScannerConfig;
 use crate::notifier::{format_price, html_escape, AlertNotifier};
 use crate::paper_trader::{CsvTradeRow, PaperPortfolioState, PaperSide, PaperTrader};
+use crate::strategy::TradingStrategy;
 
 #[derive(Clone)]
 pub struct TelegramBotController {
@@ -185,6 +186,31 @@ impl TelegramBotController {
             "/start" | "/portfolio" | "/status" | "/positions" => {
                 self.send_dashboard_message(true, None).await;
             }
+            "/strategy" | "/strat" | "/mode" => {
+                if args.is_empty() {
+                    let st = self.paper_trader.get_state_snapshot().await;
+                    let (html_text, kb) = render_strategy_html(&st, &self.config, None);
+                    let _ = self.notifier.send_telegram_html(&html_text, Some(kb)).await;
+                } else if let Some(strat) = TradingStrategy::from_str_lossy(args) {
+                    let st = self.paper_trader.set_strategy(strat).await;
+                    let eff_stars = st.effective_min_stars(&self.config);
+                    let notice = format!(
+                        "🎯 เปลี่ยนกลยุทธ์เป็น {} แล้ว — ปรับเกณฑ์เป็น ≥{}⭐ อัตโนมัติ (คงค่า Lev/Size/Max เดิม)",
+                        strat.title_th(),
+                        eff_stars
+                    );
+                    let (html_text, kb) = render_strategy_html(&st, &self.config, Some(&notice));
+                    let _ = self.notifier.send_telegram_html(&html_text, Some(kb)).await;
+                } else {
+                    let st = self.paper_trader.get_state_snapshot().await;
+                    let notice = format!(
+                        "⚠️ ไม่รู้จักกลยุทธ์ `{}` — เลือกได้: balanced, trend, breakout, reversal, scalp",
+                        args
+                    );
+                    let (html_text, kb) = render_strategy_html(&st, &self.config, Some(&notice));
+                    let _ = self.notifier.send_telegram_html(&html_text, Some(kb)).await;
+                }
+            }
             "/settings" | "/config" => {
                 let st = self.paper_trader.get_state_snapshot().await;
                 let (html_text, kb) = render_settings_html(&st, &self.config, None);
@@ -196,7 +222,7 @@ impl TelegramBotController {
                     render_settings_html(
                         &st,
                         &self.config,
-                        Some("💡 พิมพ์ค่าที่ต้องการต่อท้าย /set เช่น /set max 8 lev 15 หรือ /set default"),
+                        Some("💡 พิมพ์ค่าที่ต้องการต่อท้าย /set เช่น /set max 8 lev 15 หรือ /set strategy trend หรือ /set default"),
                     )
                 } else {
                     match parse_set_command_args(args) {
@@ -213,18 +239,31 @@ impl TelegramBotController {
                             position_pct,
                             leverage,
                             min_stars,
+                            strategy,
                         }) => {
-                            let st = self
-                                .paper_trader
-                                .update_runtime_settings(
-                                    max_open_positions,
-                                    position_pct,
-                                    leverage,
-                                    min_stars,
-                                )
-                                .await;
+                            if let Some(strat) = strategy {
+                                let _ = self.paper_trader.set_strategy(strat).await;
+                            }
+                            let st = if max_open_positions.is_some()
+                                || position_pct.is_some()
+                                || leverage.is_some()
+                                || min_stars.is_some()
+                            {
+                                self.paper_trader
+                                    .update_runtime_settings(
+                                        max_open_positions,
+                                        position_pct,
+                                        leverage,
+                                        min_stars,
+                                    )
+                                    .await
+                            } else {
+                                self.paper_trader.get_state_snapshot().await
+                            };
+                            let eff_strat = st.effective_strategy(&self.config);
                             let notice = format!(
-                                "✅ บันทึกค่าใหม่แล้ว: Max {} ไม้ | ไม้ละ {}% | {}x | ≥ {}⭐",
+                                "✅ บันทึกค่าใหม่แล้ว: {} | Max {} ไม้ | ไม้ละ {}% | {}x | ≥ {}⭐",
+                                eff_strat.short_tag(),
                                 st.effective_max_open_positions(&self.config),
                                 fmt_num_clean(st.effective_position_pct(&self.config)),
                                 fmt_num_clean(st.effective_leverage(&self.config)),
@@ -284,8 +323,9 @@ impl TelegramBotController {
                 let help_text = concat!(
                     "🤖 <b>คำสั่งควบคุมพอร์ตจำลอง (Scanner-f)</b>\n",
                     "• /portfolio — ดูสรุปพอร์ตจำลอง + ปุ่มสั่งการ\n",
+                    "• /strategy — เลือกกลยุทธ์ 5 แบบ + ดูสถิติ Win Rate/PnL แยกสาย\n",
                     "• /settings — เปิดหน้าตั้งค่า Max ไม้ / ขนาด% / Leverage / ดาว\n",
-                    "• /set — ปรับค่าเอง เช่น <code>/set max 8 lev 15</code> หรือ <code>/set default</code>\n",
+                    "• /set — ปรับค่าเอง เช่น <code>/set max 8 lev 15</code> หรือ <code>/set strategy trend</code> หรือ <code>/set default</code>\n",
                     "• /history — ดูประวัติการเทรด 10 รายการล่าสุด\n",
                     "• /scan — สแกนตลาดและอัปเดตราคาทันที\n",
                     "• /pause — พักการเปิดออเดอร์ใหม่ชั่วคราว\n",
@@ -296,6 +336,7 @@ impl TelegramBotController {
                 let kb = json!([
                     [
                         { "text": "💼 เปิดพอร์ตจำลอง", "callback_data": "paper:panel" },
+                        { "text": "🎯 เลือกกลยุทธ์", "callback_data": "paper:strategy" },
                         { "text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings" }
                     ]
                 ]);
@@ -326,6 +367,42 @@ impl TelegramBotController {
                     .notifier
                     .edit_telegram_html(chat_id, msg_id, &html_text, Some(kb))
                     .await;
+            }
+            "paper:strategy" => {
+                self.notifier
+                    .answer_telegram_callback(cb_id, Some("🎯 เปิดหน้าเลือกกลยุทธ์ + สถิติแยกสาย"), false)
+                    .await;
+                let st = self.paper_trader.get_state_snapshot().await;
+                let (html_text, kb) = render_strategy_html(&st, &self.config, None);
+                let _ = self
+                    .notifier
+                    .edit_telegram_html(chat_id, msg_id, &html_text, Some(kb))
+                    .await;
+            }
+            other if other.starts_with("paper:strat:") => {
+                let raw_strat = other.trim_start_matches("paper:strat:");
+                if let Some(strat) = TradingStrategy::from_str_lossy(raw_strat) {
+                    let st = self.paper_trader.set_strategy(strat).await;
+                    let eff_stars = st.effective_min_stars(&self.config);
+                    let toast = format!("🎯 ใช้กลยุทธ์ {} (≥{}⭐)", strat.title_th(), eff_stars);
+                    let notice = format!(
+                        "🎯 เปลี่ยนกลยุทธ์เป็น {} แล้ว — ปรับเกณฑ์เป็น ≥{}⭐ อัตโนมัติ (มีผลตั้งแต่สัญญาณถัดไป; คงค่า Lev/Size/Max เดิม)",
+                        strat.title_th(),
+                        eff_stars
+                    );
+                    self.notifier
+                        .answer_telegram_callback(cb_id, Some(&toast), false)
+                        .await;
+                    let (html_text, kb) = render_strategy_html(&st, &self.config, Some(&notice));
+                    let _ = self
+                        .notifier
+                        .edit_telegram_html(chat_id, msg_id, &html_text, Some(kb))
+                        .await;
+                } else {
+                    self.notifier
+                        .answer_telegram_callback(cb_id, Some("⚠️ ไม่พบกลยุทธ์ที่เลือก"), true)
+                        .await;
+                }
             }
             "paper:settings" => {
                 self.notifier
@@ -625,6 +702,7 @@ pub enum ParsedSetCommand {
         position_pct: Option<f64>,
         leverage: Option<f64>,
         min_stars: Option<u8>,
+        strategy: Option<TradingStrategy>,
     },
 }
 
@@ -649,7 +727,7 @@ pub fn parse_set_command_args(args: &str) -> Result<ParsedSetCommand, String> {
 
     if tokens.is_empty() {
         return Err(
-            "กรุณาระบุค่าที่ต้องการ เช่น /set lev 15 หรือ /set max 8 size 12".to_string(),
+            "กรุณาระบุค่าที่ต้องการ เช่น /set lev 15 หรือ /set strategy trend".to_string(),
         );
     }
 
@@ -664,6 +742,7 @@ pub fn parse_set_command_args(args: &str) -> Result<ParsedSetCommand, String> {
     let mut position_pct: Option<f64> = None;
     let mut leverage: Option<f64> = None;
     let mut min_stars: Option<u8> = None;
+    let mut strategy: Option<TradingStrategy> = None;
     let mut updated_any = false;
 
     let mut i = 0;
@@ -675,12 +754,22 @@ pub fn parse_set_command_args(args: &str) -> Result<ParsedSetCommand, String> {
         }
         if i + 1 >= tokens.len() {
             return Err(format!(
-                "ยังไม่ได้ใส่ตัวเลขหลัง `{}` (เช่น /set {} 10)",
-                raw_key, raw_key
+                "ยังไม่ได้ใส่ค่าหลัง `{}` (เช่น /set strategy trend หรือ /set lev 15)",
+                raw_key
             ));
         }
         let raw_val = tokens[i + 1].trim();
         match key.as_str() {
+            "strategy" | "strat" | "mode" | "profile" | "กลยุทธ์" | "สาย" => {
+                let parsed = TradingStrategy::from_str_lossy(raw_val).ok_or_else(|| {
+                    format!(
+                        "ไม่รู้จักกลยุทธ์ `{}` — เลือกได้: balanced, trend, breakout, reversal, scalp",
+                        raw_val
+                    )
+                })?;
+                strategy = Some(parsed);
+                updated_any = true;
+            }
             "max" | "maxpos" | "max_pos" | "max_positions" | "positions" | "pos" | "limit"
             | "ไม้" => {
                 let cleaned = raw_val.trim_end_matches("ไม้").trim();
@@ -732,7 +821,7 @@ pub fn parse_set_command_args(args: &str) -> Result<ParsedSetCommand, String> {
             }
             _ => {
                 return Err(format!(
-                    "ไม่รู้จักหัวข้อ `{}` — ใช้ max, size, lev, stars หรือ default",
+                    "ไม่รู้จักหัวข้อ `{}` — ใช้ strategy, max, size, lev, stars หรือ default",
                     raw_key
                 ));
             }
@@ -749,6 +838,7 @@ pub fn parse_set_command_args(args: &str) -> Result<ParsedSetCommand, String> {
         position_pct,
         leverage,
         min_stars,
+        strategy,
     })
 }
 
@@ -779,12 +869,18 @@ pub fn render_dashboard_html(
         "🟢 เปิดรับสัญญาณอัตโนมัติ"
     };
 
+    let eff_strat = state.effective_strategy(cfg);
     let eff_lev = state.effective_leverage(cfg);
     let eff_pct = state.effective_position_pct(cfg);
     let eff_max = state.effective_max_open_positions(cfg);
     let eff_stars = state.effective_min_stars(cfg);
     let custom_badge = if state.has_custom_settings() {
         " [ปรับเอง]"
+    } else {
+        ""
+    };
+    let strat_lock = if eff_strat.requires_1h_alignment() {
+        " [1h Lock]"
     } else {
         ""
     };
@@ -796,6 +892,11 @@ pub fn render_dashboard_html(
     }
     lines.push("💼 <b>พอร์ตจำลองการเทรด (Paper Trading Dashboard)</b>".to_string());
     lines.push(format!("• สถานะเปิดไม้ใหม่: <code>{}</code>", status_badge));
+    lines.push(format!(
+        "• กลยุทธ์ที่ใช้งาน: <code>{}{}</code>",
+        html_escape(eff_strat.title_th()),
+        strat_lock
+    ));
     lines.push(format!(
         "• ตั้งค่าไม้: <code>{}x | ไม้ละ {}% | สูงสุด {} ไม้ | ≥ {}⭐{}</code>",
         fmt_num_clean(eff_lev),
@@ -847,19 +948,22 @@ pub fn render_dashboard_html(
             } else {
                 "🔴 SHORT"
             };
+            let remain_pct = (p.remaining_fraction * 100.0).round();
+            let pos_strat = TradingStrategy::from_str_lossy(&p.strategy).unwrap_or_default();
             let stage = if p.tp2_hit {
-                "TP1+TP2 (ถือ 30%)"
+                format!("TP1+TP2 (ถือ {:.0}%)", remain_pct)
             } else if p.tp1_hit {
-                "กันทุน BE (ถือ 60%)"
+                format!("กันทุน BE (ถือ {:.0}%)", remain_pct)
             } else {
-                "รอ TP1 (ถือ 100%)"
+                "รอ TP1 (ถือ 100%)".to_string()
             };
             lines.push(format!(
-                "{}) #{} {} <b>{}</b> | <code>${}</code> → <code>${}</code>",
+                "{}) #{} {} <b>{}</b> [{}] | <code>${}</code> → <code>${}</code>",
                 idx + 1,
                 p.id,
                 side_icon,
                 html_escape(&p.symbol),
+                html_escape(pos_strat.short_tag()),
                 format_price(p.entry_price),
                 format_price(p.last_price)
             ));
@@ -903,14 +1007,141 @@ pub fn render_dashboard_html(
     }
 
     rows.push(vec![
-        json!({ "text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings" }),
         json!({
-            "text": format!("🔄 รีเซ็ตพอร์ต (${:.0})", cfg.paper_initial_balance),
-            "callback_data": "paper:reset_prompt"
+            "text": format!("🎯 กลยุทธ์ ({})", eff_strat.short_tag()),
+            "callback_data": "paper:strategy"
         }),
+        json!({ "text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings" }),
     ]);
 
+    rows.push(vec![json!({
+        "text": format!("🔄 รีเซ็ตพอร์ต (${:.0})", cfg.paper_initial_balance),
+        "callback_data": "paper:reset_prompt"
+    })]);
+
     (lines.join("\n"), json!(rows))
+}
+
+pub fn render_strategy_html(
+    state: &PaperPortfolioState,
+    cfg: &ScannerConfig,
+    notice_line: Option<&str>,
+) -> (String, Value) {
+    let eff_strat = state.effective_strategy(cfg);
+    let eff_stars = state.effective_min_stars(cfg);
+    let profile = eff_strat.trade_profile();
+    let default_stars = eff_strat.default_min_stars(cfg.paper_min_stars);
+    let strat_source = if state.custom_strategy.is_some() {
+        "🎛️ เลือกผ่าน Telegram"
+    } else {
+        "📄 ค่าเริ่มต้น .env"
+    };
+
+    let mut lines = Vec::new();
+    if let Some(note) = notice_line {
+        lines.push(format!("ℹ️ <i>{}</i>", html_escape(note)));
+        lines.push(String::new());
+    }
+    lines.push("🎯 <b>เลือกกลยุทธ์การสแกน &amp; จำลองการเทรด</b>".to_string());
+    lines.push(format!(
+        "• กลยุทธ์ปัจจุบัน: <b>{}</b> (<code>{}</code>)",
+        html_escape(eff_strat.title_th()),
+        strat_source
+    ));
+    lines.push(format!(
+        "• แนวทาง: <i>{}</i>",
+        html_escape(eff_strat.description_th())
+    ));
+    lines.push(format!(
+        "• สัญญาณที่รับ: <code>{}</code>",
+        html_escape(eff_strat.signals_summary_th())
+    ));
+    lines.push(format!(
+        "• เงื่อนไข MTF &amp; ดาว: <code>{} | เกณฑ์เข้า ≥ {}⭐ (ค่าเริ่มต้นสายนี้ ≥ {}⭐)</code>",
+        if eff_strat.requires_1h_alignment() {
+            "บังคับตามเทรนด์ 1h"
+        } else {
+            "ยืดหยุ่น 1h"
+        },
+        eff_stars,
+        default_stars
+    ));
+    lines.push(format!(
+        "• แผน SL/TP: <code>SL {:.2}%–{:.2}% | TP {:.1}R/{:.1}R/{:.1}R | แบ่งปิด {:.0}/{:.0}/{:.0}%</code>",
+        profile.min_risk_pct,
+        profile.max_risk_pct,
+        profile.tp1_r,
+        profile.tp2_r,
+        profile.tp3_r,
+        profile.tp1_close_pct,
+        profile.tp2_close_pct,
+        profile.tp3_close_pct
+    ));
+
+    lines.push(String::new());
+    lines.push("📚 <b>สรุป 5 กลยุทธ์ (กดปุ่มเพื่อสลับได้ทันที):</b>".to_string());
+    for s in TradingStrategy::all() {
+        let p = s.trade_profile();
+        let active_mark = if *s == eff_strat { "✅ " } else { "• " };
+        lines.push(format!(
+            "{}<b>{}</b> (≥{}⭐ | {}/{}/{}% | Max SL {:.1}%)",
+            active_mark,
+            html_escape(s.title_th()),
+            s.default_min_stars(cfg.paper_min_stars),
+            fmt_num_clean(p.tp1_close_pct),
+            fmt_num_clean(p.tp2_close_pct),
+            fmt_num_clean(p.tp3_close_pct),
+            p.max_risk_pct
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push("📊 <b>สถิติ Win Rate / PnL แยกตามกลยุทธ์:</b>".to_string());
+    let mut any_stats = false;
+    for s in TradingStrategy::all() {
+        if let Some(st_perf) = state.strategy_stats.get(s.key()) {
+            if st_perf.trades > 0 {
+                any_stats = true;
+                lines.push(format!(
+                    "• {}: <code>{} ไม้</code> | WR <code>{:.1}%</code> (<code>{}W/{}L</code>) | PnL <code>{:+.2} USDT</code>",
+                    html_escape(s.short_tag()),
+                    st_perf.trades,
+                    st_perf.win_rate_pct(),
+                    st_perf.wins,
+                    st_perf.losses,
+                    st_perf.realized_pnl
+                ));
+            }
+        }
+    }
+    if !any_stats {
+        lines.push("• <i>ยังไม่มีประวัติปิดไม้แยกตามกลยุทธ์ (จะบันทึกอัตโนมัติเมื่อปิดออเดอร์)</i>".to_string());
+    }
+
+    lines.push(String::new());
+    lines.push("💡 <i>สลับกลยุทธ์จะตั้งค่า Min ดาว ตามสายนั้นให้อัตโนมัติ (คง Lev/Size/Max เดิม) และไม้ที่ถืออยู่แล้วยังปิดตามแผนเดิม</i>".to_string());
+    lines.push("⌨️ <b>คำสั่งด่วน:</b> <code>/strategy trend</code> · <code>/set strategy scalp lev 15</code>".to_string());
+
+    let strat_btn = |s: TradingStrategy| {
+        let label = if s == eff_strat {
+            format!("✅ {}", s.title_th())
+        } else {
+            s.title_th().to_string()
+        };
+        json!({ "text": label, "callback_data": format!("paper:strat:{}", s.key()) })
+    };
+
+    let kb = json!([
+        [strat_btn(TradingStrategy::Balanced), strat_btn(TradingStrategy::TrendFollow)],
+        [strat_btn(TradingStrategy::Breakout), strat_btn(TradingStrategy::ReversalSniper)],
+        [strat_btn(TradingStrategy::ScalpQuick)],
+        [
+            { "text": "⚙️ ตั้งค่าพอร์ต", "callback_data": "paper:settings" },
+            { "text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh" }
+        ]
+    ]);
+
+    (lines.join("\n"), kb)
 }
 
 pub fn render_settings_html(
@@ -918,6 +1149,8 @@ pub fn render_settings_html(
     cfg: &ScannerConfig,
     notice_line: Option<&str>,
 ) -> (String, Value) {
+    let eff_strat = state.effective_strategy(cfg);
+    let profile = eff_strat.trade_profile();
     let eff_max = state.effective_max_open_positions(cfg);
     let eff_pct = state.effective_position_pct(cfg);
     let eff_lev = state.effective_leverage(cfg);
@@ -947,6 +1180,15 @@ pub fn render_settings_html(
     lines.push("⚙️ <b>ตั้งค่าจำนวนไม้ & ขนาดไม้พอร์ตจำลอง</b>".to_string());
     lines.push(format!("• แหล่งค่าตั้ง: {}", source_badge));
     lines.push(format!(
+        "• กลยุทธ์ที่ใช้งาน: <code>{}</code> (SL {:.2}%–{:.2}% | TP ปิด {:.0}/{:.0}/{:.0}%)",
+        html_escape(eff_strat.title_th()),
+        profile.min_risk_pct,
+        profile.max_risk_pct,
+        profile.tp1_close_pct,
+        profile.tp2_close_pct,
+        profile.tp3_close_pct
+    ));
+    lines.push(format!(
         "• จำนวนไม้สูงสุด (Max): <code>{} ไม้</code> (กำลังถืออยู่ {}/{})",
         eff_max,
         state.open_positions.len(),
@@ -965,8 +1207,9 @@ pub fn render_settings_html(
     ));
     lines.push(format!("• เกณฑ์เข้าสัญญาณ: <code>{}</code>", stars_desc));
     lines.push(format!(
-        "• โควตารวมสูงสุด (Max × Size): <code>{}%</code> | ค่าเริ่มต้น .env: <code>{} ไม้ / {}% / {}x / ≥{}⭐</code>",
+        "• โควตารวมสูงสุด (Max × Size): <code>{}%</code> | ค่าเริ่มต้น .env: <code>{} | {} ไม้ / {}% / {}x / ≥{}⭐</code>",
         fmt_num_clean(total_alloc_pct),
+        cfg.scanner_strategy.short_tag(),
         cfg.paper_max_open_positions,
         fmt_num_clean(cfg.paper_position_pct),
         fmt_num_clean(cfg.paper_leverage),
@@ -976,8 +1219,10 @@ pub fn render_settings_html(
     if eff_lev >= 20.0 {
         lines.push(String::new());
         lines.push(format!(
-            "⚠️ <b>คำเตือน Leverage สูง ({}x):</b> ระบบวาง Stop Loss กว้างสุด ~4.8% จึงเสี่ยงถูก <b>Liquidate ล้าง Margin ไม้นั้น (-100%)</b> ก่อนถึงจุด SL หากราคาสะบัดแรง",
-            fmt_num_clean(eff_lev)
+            "⚠️ <b>คำเตือน Leverage สูง ({}x):</b> กลยุทธ์ {} วาง Stop Loss กว้างสุด ~{:.1}% จึงเสี่ยงถูก <b>Liquidate ล้าง Margin ไม้นั้น (-100%)</b> ก่อนถึงจุด SL หากราคาสะบัดแรง",
+            fmt_num_clean(eff_lev),
+            html_escape(eff_strat.short_tag()),
+            profile.max_risk_pct
         ));
     }
     if total_alloc_pct > 100.0 {
@@ -993,10 +1238,10 @@ pub fn render_settings_html(
     lines.push(String::new());
     lines.push("🎛️ <b>กดปุ่มด้านล่าง (แถว: Max ไม้ → ขนาด% → Leverage → ดาว):</b>".to_string());
     lines.push(
-        "💡 <b>หรือพิมพ์ปรับค่าละเอียด:</b> <code>/set max 8 lev 15</code> · <code>/set size 12</code> · <code>/set stars 3</code> · <code>/set default</code>"
+        "💡 <b>หรือพิมพ์ปรับค่าละเอียด:</b> <code>/set strategy trend lev 15</code> · <code>/set max 8 size 12</code> · <code>/set stars 3</code> · <code>/set default</code>"
             .to_string(),
     );
-    lines.push("<i>หมายเหตุ: ไม้ที่ถืออยู่แล้วคง Margin/Lev เดิม — ค่าใหม่มีผลตั้งแต่ไม้ถัดไป</i>".to_string());
+    lines.push("<i>หมายเหตุ: ไม้ที่ถืออยู่แล้วคง Margin/Lev และแผน TP เดิม — ค่าใหม่มีผลตั้งแต่ไม้ถัดไป</i>".to_string());
 
     let max_row: Vec<Value> = [3usize, 5, 8, 10, 15]
         .iter()
@@ -1045,12 +1290,16 @@ pub fn render_settings_html(
         }),
     ];
 
-    let footer_row = vec![
+    let strat_footer_row = vec![
+        json!({
+            "text": format!("🎯 กลยุทธ์ ({})", eff_strat.short_tag()),
+            "callback_data": "paper:strategy"
+        }),
         json!({ "text": "🔄 คืนค่าเริ่มต้น (.env)", "callback_data": "paper:cfg_default" }),
-        json!({ "text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh" }),
     ];
+    let back_row = vec![json!({ "text": "⬅️ กลับหน้าพอร์ต", "callback_data": "paper:refresh" })];
 
-    let kb = json!([max_row, size_row, lev_row, stars_row, footer_row]);
+    let kb = json!([max_row, size_row, lev_row, stars_row, strat_footer_row, back_row]);
     (lines.join("\n"), kb)
 }
 
@@ -1075,11 +1324,13 @@ pub fn render_manage_html(state: &PaperPortfolioState) -> (String, Value) {
         } else {
             "🔴"
         };
+        let pos_strat = TradingStrategy::from_str_lossy(&p.strategy).unwrap_or_default();
         lines.push(format!(
-            "• #{} {} <b>{}</b> | ราคา <code>${}</code> | uPnL <code>{:+.2} ({:+.1}%)</code>",
+            "• #{} {} <b>{}</b> [{}] | ราคา <code>${}</code> | uPnL <code>{:+.2} ({:+.1}%)</code>",
             p.id,
             side_icon,
             html_escape(&p.symbol),
+            html_escape(pos_strat.short_tag()),
             format_price(p.last_price),
             upnl,
             uroe
@@ -1118,13 +1369,22 @@ pub fn render_history_html(rows: &[CsvTradeRow]) -> (String, Value) {
                 "STOP_LOSS" => "🛑",
                 _ => "📌",
             };
+            let strat_badge = if r.strategy.is_empty() {
+                String::new()
+            } else {
+                let short = TradingStrategy::from_str_lossy(&r.strategy)
+                    .map(|s| s.short_tag().to_string())
+                    .unwrap_or_else(|| r.strategy.clone());
+                format!(" [{}]", html_escape(&short))
+            };
             lines.push(format!(
-                "{} <code>{}</code> #{} <b>{}</b> ({}) | <code>{}</code> | ${} | <code>{:+.2} USDT</code>",
+                "{} <code>{}</code> #{} <b>{}</b> ({}){} | <code>{}</code> | ${} | <code>{:+.2} USDT</code>",
                 icon,
                 html_escape(short_ts),
                 html_escape(&r.trade_id),
                 html_escape(&r.symbol),
                 html_escape(&r.side),
+                strat_badge,
                 html_escape(&r.event),
                 format_price(r.exec_price),
                 r.net_pnl
@@ -1159,7 +1419,7 @@ pub fn render_close_all_confirm_html(state: &PaperPortfolioState) -> (String, Va
 
 pub fn render_reset_confirm_html(cfg: &ScannerConfig) -> (String, Value) {
     let text = format!(
-        "⚠️ <b>ยืนยันการรีเซ็ตพอร์ตจำลอง</b>\n\nการรีเซ็ตจะล้างออเดอร์ที่ถืออยู่ทั้งหมด สถิติ Win Rate และไฟล์ประวัติเทรด CSV แล้วตั้งต้นใหม่เป็น <code>${:.2} USDT</code> <i>(ค่าตั้ง Max ไม้/Size/Lev ที่ปรับไว้จะยังคงเดิม)</i>\nต้องการยืนยันหรือไม่?",
+        "⚠️ <b>ยืนยันการรีเซ็ตพอร์ตจำลอง</b>\n\nการรีเซ็ตจะล้างออเดอร์ที่ถืออยู่ทั้งหมด สถิติ Win Rate และไฟล์ประวัติเทรด CSV แล้วตั้งต้นใหม่เป็น <code>${:.2} USDT</code> <i>(คงกลยุทธ์และค่าตั้ง Max ไม้/Size/Lev ที่ปรับไว้ — ล้างเฉพาะสถิติแยกกลยุทธ์)</i>\nต้องการยืนยันหรือไม่?",
         cfg.paper_initial_balance
     );
     let kb = json!([[
@@ -1173,6 +1433,7 @@ pub fn render_reset_confirm_html(cfg: &ScannerConfig) -> (String, Value) {
 mod tests {
     use super::*;
     use crate::paper_trader::PaperPosition;
+    use crate::strategy::StrategyPerfStats;
 
     #[test]
     fn test_render_dashboard_and_buttons() {
@@ -1184,6 +1445,7 @@ mod tests {
         cfg.paper_min_stars = 2;
 
         let mut st = PaperPortfolioState::new(1000.0);
+        st.custom_strategy = Some("TREND_FOLLOW".to_string());
         st.open_positions.push(PaperPosition {
             id: 1,
             symbol: "BTC&ETH<TEST>".to_string(),
@@ -1191,6 +1453,9 @@ mod tests {
             stars: 3,
             signal_category: "RSI_OS".to_string(),
             timeframe: "5m+15m+1h".to_string(),
+            strategy: "TREND_FOLLOW".to_string(),
+            tp1_close_pct: 25.0,
+            tp2_close_pct: 35.0,
             entry_price: 95000.0,
             initial_sl: 94000.0,
             current_sl: 95100.0,
@@ -1199,10 +1464,10 @@ mod tests {
             tp3: 98500.0,
             leverage: 10.0,
             initial_margin: 100.0,
-            remaining_margin: 60.0,
+            remaining_margin: 75.0,
             initial_qty: 0.01,
-            remaining_qty: 0.006,
-            remaining_fraction: 0.6,
+            remaining_qty: 0.0075,
+            remaining_fraction: 0.75,
             tp1_hit: true,
             tp2_hit: false,
             realized_pnl_trade: 4.0,
@@ -1214,11 +1479,14 @@ mod tests {
         let (html, kb) = render_dashboard_html(&st, &cfg, Some("ทดสอบ <แจ้งเตือน>"));
         assert!(html.contains("&amp;"));
         assert!(html.contains("&lt;TEST&gt;"));
-        assert!(html.contains("กันทุน BE (ถือ 60%)"));
+        assert!(html.contains("[Trend]"));
+        assert!(html.contains("กันทุน BE (ถือ 75%)"));
         assert!(html.contains("10x | ไม้ละ 10% | สูงสุด 5 ไม้"));
         let rows = kb.as_array().unwrap();
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[3][0]["callback_data"], "paper:settings");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[3][0]["callback_data"], "paper:strategy");
+        assert_eq!(rows[3][1]["callback_data"], "paper:settings");
+        assert_eq!(rows[4][0]["callback_data"], "paper:reset_prompt");
     }
 
     #[test]
@@ -1231,6 +1499,7 @@ mod tests {
         cfg.paper_min_stars = 2;
 
         let mut st = PaperPortfolioState::new(1000.0);
+        st.custom_strategy = Some("SCALP_QUICK".to_string());
         st.custom_max_open_positions = Some(8);
         st.custom_position_pct = Some(20.0);
         st.custom_leverage = Some(20.0);
@@ -1240,14 +1509,45 @@ mod tests {
         assert!(html.contains("อัปเดตสำเร็จ"));
         assert!(html.contains("ปรับแต่งผ่าน Telegram"));
         assert!(html.contains("คำเตือน Leverage สูง (20x)"));
+        assert!(html.contains("~2.8%"));
         assert!(html.contains("คำเตือนสัดส่วน Margin เกิน 100% (8 × 20% = 160%)"));
         let rows = kb.as_array().unwrap();
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         assert_eq!(rows[0][2]["text"], "✅8ไม้");
         assert_eq!(rows[1][3]["text"], "✅20%");
         assert_eq!(rows[2][4]["text"], "✅20x");
         assert_eq!(rows[3][1]["text"], "✅ เฉพาะ 3⭐ A+");
-        assert_eq!(rows[4][0]["callback_data"], "paper:cfg_default");
+        assert_eq!(rows[4][0]["callback_data"], "paper:strategy");
+        assert_eq!(rows[4][1]["callback_data"], "paper:cfg_default");
+        assert_eq!(rows[5][0]["callback_data"], "paper:refresh");
+    }
+
+    #[test]
+    fn test_render_strategy_html_and_stats() {
+        let mut cfg = ScannerConfig::from_env();
+        cfg.paper_min_stars = 2;
+        let mut st = PaperPortfolioState::new(1000.0);
+        st.custom_strategy = Some("TREND_FOLLOW".to_string());
+        st.strategy_stats.insert(
+            "TREND_FOLLOW".to_string(),
+            StrategyPerfStats {
+                trades: 4,
+                wins: 3,
+                losses: 1,
+                realized_pnl: 42.5,
+            },
+        );
+
+        let (html, kb) = render_strategy_html(&st, &cfg, Some("สลับสำเร็จ <ok>"));
+        assert!(html.contains("สลับสำเร็จ &lt;ok&gt;"));
+        assert!(html.contains("Trend Follow"));
+        assert!(html.contains("บังคับตามเทรนด์ 1h"));
+        assert!(html.contains("75.0%"));
+        assert!(html.contains("+42.50 USDT"));
+        let rows = kb.as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0][1]["callback_data"], "paper:strat:TREND_FOLLOW");
+        assert!(rows[0][1]["text"].as_str().unwrap().starts_with("✅ "));
     }
 
     #[test]
@@ -1263,6 +1563,17 @@ mod tests {
                 position_pct: Some(12.5),
                 leverage: Some(15.0),
                 min_stars: Some(3),
+                strategy: None,
+            }
+        );
+        assert_eq!(
+            parse_set_command_args("strat trend lev 15").unwrap(),
+            ParsedSetCommand::Update {
+                max_open_positions: None,
+                position_pct: None,
+                leverage: Some(15.0),
+                min_stars: None,
+                strategy: Some(TradingStrategy::TrendFollow),
             }
         );
         assert_eq!(
@@ -1272,10 +1583,12 @@ mod tests {
                 position_pct: None,
                 leverage: Some(125.0),
                 min_stars: None,
+                strategy: None,
             }
         );
         assert!(parse_set_command_args("lev").is_err());
         assert!(parse_set_command_args("unknown 10").is_err());
+        assert!(parse_set_command_args("strategy nope").is_err());
         assert!(parse_set_command_args("max 0").is_err());
     }
 }

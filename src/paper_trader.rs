@@ -14,8 +14,21 @@ use crate::config::ScannerConfig;
 use crate::indicators::MtfTradeLevels;
 use crate::models::{SignalCategory, SignalDirection};
 use crate::notifier::{format_price, AlertNotifier};
+use crate::strategy::{record_strategy_closed_trade, StrategyPerfStats, TradingStrategy};
 
-const CSV_HEADER: &str = "timestamp,trade_id,event,symbol,side,stars,timeframe,signal,entry_price,exec_price,closed_pct,margin_used,leverage,gross_pnl_usdt,fee_usdt,net_pnl_usdt,balance_after_usdt,equity_after_usdt,note\n";
+const CSV_HEADER: &str = "timestamp,trade_id,event,symbol,side,stars,timeframe,signal,entry_price,exec_price,closed_pct,margin_used,leverage,gross_pnl_usdt,fee_usdt,net_pnl_usdt,balance_after_usdt,equity_after_usdt,note,strategy\n";
+
+fn default_position_strategy() -> String {
+    TradingStrategy::Balanced.key().to_string()
+}
+
+fn default_tp1_close_pct() -> f64 {
+    40.0
+}
+
+fn default_tp2_close_pct() -> f64 {
+    30.0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaperSide {
@@ -40,6 +53,12 @@ pub struct PaperPosition {
     pub stars: u8,
     pub signal_category: String,
     pub timeframe: String,
+    #[serde(default = "default_position_strategy")]
+    pub strategy: String,
+    #[serde(default = "default_tp1_close_pct")]
+    pub tp1_close_pct: f64,
+    #[serde(default = "default_tp2_close_pct")]
+    pub tp2_close_pct: f64,
     pub entry_price: f64,
     pub initial_sl: f64,
     pub current_sl: f64,
@@ -61,6 +80,21 @@ pub struct PaperPosition {
 }
 
 impl PaperPosition {
+    pub fn tp_close_splits(&self) -> (f64, f64, f64) {
+        let tp1 = if self.tp1_close_pct.is_finite() {
+            self.tp1_close_pct.clamp(10.0, 80.0)
+        } else {
+            40.0
+        };
+        let tp2 = if self.tp2_close_pct.is_finite() {
+            self.tp2_close_pct.clamp(10.0, 90.0 - tp1)
+        } else {
+            30.0
+        };
+        let tp3 = (100.0 - tp1 - tp2).max(5.0);
+        (tp1, tp2, tp3)
+    }
+
     pub fn unrealized_pnl(&self) -> f64 {
         match self.side {
             PaperSide::Long => (self.last_price - self.entry_price) * self.remaining_qty,
@@ -99,6 +133,10 @@ pub struct PaperPortfolioState {
     pub custom_max_open_positions: Option<usize>,
     #[serde(default)]
     pub custom_min_stars: Option<u8>,
+    #[serde(default)]
+    pub custom_strategy: Option<String>,
+    #[serde(default)]
+    pub strategy_stats: HashMap<String, StrategyPerfStats>,
     pub open_positions: Vec<PaperPosition>,
 }
 
@@ -111,6 +149,7 @@ pub struct CsvTradeRow {
     pub side: String,
     pub exec_price: f64,
     pub net_pnl: f64,
+    pub strategy: String,
 }
 
 impl PaperPortfolioState {
@@ -131,8 +170,17 @@ impl PaperPortfolioState {
             custom_position_pct: None,
             custom_max_open_positions: None,
             custom_min_stars: None,
+            custom_strategy: None,
+            strategy_stats: HashMap::new(),
             open_positions: Vec::new(),
         }
+    }
+
+    pub fn effective_strategy(&self, cfg: &ScannerConfig) -> TradingStrategy {
+        self.custom_strategy
+            .as_deref()
+            .and_then(TradingStrategy::from_str_lossy)
+            .unwrap_or(cfg.scanner_strategy)
     }
 
     pub fn effective_leverage(&self, cfg: &ScannerConfig) -> f64 {
@@ -154,9 +202,11 @@ impl PaperPortfolioState {
     }
 
     pub fn effective_min_stars(&self, cfg: &ScannerConfig) -> u8 {
-        self.custom_min_stars
-            .unwrap_or(cfg.paper_min_stars)
-            .clamp(1, 3)
+        if let Some(s) = self.custom_min_stars {
+            return s.clamp(1, 3);
+        }
+        self.effective_strategy(cfg)
+            .default_min_stars(cfg.paper_min_stars)
     }
 
     pub fn has_custom_settings(&self) -> bool {
@@ -164,6 +214,7 @@ impl PaperPortfolioState {
             || self.custom_position_pct.is_some()
             || self.custom_max_open_positions.is_some()
             || self.custom_min_stars.is_some()
+            || self.custom_strategy.is_some()
     }
 
     pub fn reset_preserving_settings(&self, initial_balance: f64) -> Self {
@@ -172,6 +223,7 @@ impl PaperPortfolioState {
         fresh.custom_position_pct = self.custom_position_pct;
         fresh.custom_max_open_positions = self.custom_max_open_positions;
         fresh.custom_min_stars = self.custom_min_stars;
+        fresh.custom_strategy = self.custom_strategy.clone();
         fresh
     }
 
@@ -280,9 +332,27 @@ impl PaperTrader {
         self.state.lock().await.clone()
     }
 
+    pub async fn get_effective_strategy_and_min_stars(&self) -> (TradingStrategy, u8) {
+        let st = self.state.lock().await;
+        (
+            st.effective_strategy(&self.config),
+            st.effective_min_stars(&self.config),
+        )
+    }
+
     pub async fn set_paused(&self, paused: bool) -> PaperPortfolioState {
         let mut st = self.state.lock().await;
         st.paused_opening = paused;
+        let _ = self.save_state_sync(&st);
+        st.clone()
+    }
+
+    pub async fn set_strategy(&self, strategy: TradingStrategy) -> PaperPortfolioState {
+        let mut st = self.state.lock().await;
+        st.custom_strategy = Some(strategy.key().to_string());
+        // Switching strategy automatically resets custom_min_stars so the strategy's own Min Stars takes effect
+        // while Leverage, Position %, and Max Open Positions remain untouched.
+        st.custom_min_stars = None;
         let _ = self.save_state_sync(&st);
         st.clone()
     }
@@ -321,6 +391,7 @@ impl PaperTrader {
         st.custom_position_pct = None;
         st.custom_max_open_positions = None;
         st.custom_min_stars = None;
+        st.custom_strategy = None;
         let _ = self.save_state_sync(&st);
         st.clone()
     }
@@ -339,6 +410,7 @@ impl PaperTrader {
             if cols.len() < 16 {
                 continue;
             }
+            let strategy = cols.get(19).map(|s| s.trim()).unwrap_or("").to_string();
             rows.push(CsvTradeRow {
                 timestamp: cols[0].to_string(),
                 trade_id: cols[1].to_string(),
@@ -347,6 +419,7 @@ impl PaperTrader {
                 side: cols[4].to_string(),
                 exec_price: cols[9].parse::<f64>().unwrap_or(0.0),
                 net_pnl: cols[15].parse::<f64>().unwrap_or(0.0),
+                strategy,
             });
         }
         if rows.len() > limit {
@@ -397,8 +470,13 @@ impl PaperTrader {
 
         let ts = Utc::now().to_rfc3339();
         let safe_note = note.replace(',', ";");
+        let strat_col = if pos.strategy.is_empty() {
+            TradingStrategy::Balanced.key()
+        } else {
+            pos.strategy.as_str()
+        };
         let row = format!(
-            "{},{},{},{},{},{},{},{},{:.8},{:.8},{:.1},{:.4},{:.1},{:.4},{:.4},{:.4},{:.4},{:.4},{}\n",
+            "{},{},{},{},{},{},{},{},{:.8},{:.8},{:.1},{:.4},{:.1},{:.4},{:.4},{:.4},{:.4},{:.4},{},{}\n",
             ts,
             trade_id,
             event,
@@ -417,7 +495,8 @@ impl PaperTrader {
             net_pnl,
             free_balance_after,
             equity_after,
-            safe_note
+            safe_note,
+            strat_col
         );
         let _ = file.write_all(row.as_bytes());
     }
@@ -449,6 +528,8 @@ impl PaperTrader {
             if st.paused_opening {
                 return None;
             }
+            let active_strat = st.effective_strategy(&self.config);
+            let prof = active_strat.trade_profile();
             let eff_min_stars = st.effective_min_stars(&self.config);
             if stars < eff_min_stars {
                 return None;
@@ -494,6 +575,9 @@ impl PaperTrader {
                 stars,
                 signal_category: category.as_key().to_string(),
                 timeframe: timeframe.to_string(),
+                strategy: active_strat.key().to_string(),
+                tp1_close_pct: prof.tp1_close_pct,
+                tp2_close_pct: prof.tp2_close_pct,
                 entry_price: levels.entry_price,
                 initial_sl: levels.sl,
                 current_sl: levels.sl,
@@ -530,24 +614,34 @@ impl PaperTrader {
                 -entry_fee,
                 free_after,
                 eq_after,
-                &format!("{} ({}*)", category.as_key(), stars),
+                &format!("{} ({}* | {})", category.as_key(), stars, active_strat.short_tag()),
             );
             let _ = self.save_state_sync(&st);
 
+            let (tp1_pct, tp2_pct, tp3_pct) = pos.tp_close_splits();
             let side_emoji = if side == PaperSide::Long { "🟢 LONG" } else { "🔴 SHORT" };
             let title = format!("🧪 [PAPER] เปิดไม้ #{} {} {}", trade_id, side_emoji, symbol);
             let lines_th = vec![
-                format!("⭐ สัญญาณ: {} ({} ดาว | TF: {})", category.as_key(), stars, timeframe),
+                format!(
+                    "🎯 กลยุทธ์: {} | ⭐ {} ({} ดาว | TF: {})",
+                    active_strat.title_th(),
+                    category.as_key(),
+                    stars,
+                    timeframe
+                ),
                 format!(
                     "💰 Margin: ${:.2} ({:.0}x | มูลค่าสัญญา ${:.2})",
                     margin, eff_leverage, notional
                 ),
                 format!("🎯 ราคาเข้า (Entry): ${}", format_price(levels.entry_price)),
                 format!(
-                    "📊 เป้าปิด 3 ส่วน: TP1 ${} (40%) | TP2 ${} (30%) | TP3 ${} (30%)",
+                    "📊 เป้าปิด 3 ส่วน: TP1 ${} ({:.0}%) | TP2 ${} ({:.0}%) | TP3 ${} ({:.0}%)",
                     format_price(levels.tp1),
+                    tp1_pct,
                     format_price(levels.tp2),
-                    format_price(levels.tp3)
+                    tp2_pct,
+                    format_price(levels.tp3),
+                    tp3_pct
                 ),
                 format!(
                     "🛡️ Stop Loss: ${} (-{:.2}%) | ค่าธรรมเนียม: ${:.2}",
@@ -598,7 +692,7 @@ impl PaperTrader {
         self.update_prices(&map).await;
     }
 
-    /// Evaluates TP1 (40% + BE), TP2 (30% + Trail to TP1), TP3 (30%), and SL across open positions.
+    /// Evaluates per-strategy partial TP1 (+BE), TP2 (+Trail to TP1), TP3, and SL across open positions.
     pub async fn update_prices(&self, prices: &HashMap<String, f64>) {
         if !self.config.paper_trading_enabled || prices.is_empty() {
             return;
@@ -628,6 +722,8 @@ impl PaperTrader {
 
                 st.open_positions[idx].last_price = price;
                 let mut pos = st.open_positions[idx].clone();
+                let (tp1_pct, tp2_pct, tp3_pct) = pos.tp_close_splits();
+                let pos_strat = TradingStrategy::from_str_lossy(&pos.strategy).unwrap_or_default();
                 let mut closed_completely = false;
 
                 // 1. Check Stop Loss first if price crossed current_sl
@@ -664,6 +760,11 @@ impl PaperTrader {
                     } else {
                         st.loss_count += 1;
                     }
+                    record_strategy_closed_trade(
+                        &mut st.strategy_stats,
+                        &pos.strategy,
+                        pos.realized_pnl_trade,
+                    );
 
                     st.open_positions.remove(idx);
                     st.update_drawdown();
@@ -702,9 +803,10 @@ impl PaperTrader {
                     let title = format!("{} [PAPER] ปิดไม้ #{} {} — {}", icon, pos.id, pos.symbol, label);
                     let lines_th = vec![
                         format!(
-                            "📌 สถานะ: {} ({})",
+                            "📌 สถานะ: {} ({}) | 🎯 {}",
                             pos.side.as_str(),
-                            label
+                            label,
+                            pos_strat.title_th()
                         ),
                         format!(
                             "🎯 Entry: ${} -> Exit: ${}",
@@ -735,7 +837,7 @@ impl PaperTrader {
                     continue;
                 }
 
-                // 2. Check TP1 (40% + move SL to Breakeven)
+                // 2. Check TP1 (tp1_pct% + move SL to Breakeven)
                 let tp1_hit_now = !pos.tp1_hit
                     && match pos.side {
                         PaperSide::Long => price >= pos.tp1,
@@ -743,7 +845,8 @@ impl PaperTrader {
                     };
 
                 if tp1_hit_now {
-                    let frac = 0.40;
+                    let frac = tp1_pct / 100.0;
+                    let remain_after_tp1 = (100.0 - tp1_pct).max(0.0);
                     let close_qty = pos.initial_qty * frac;
                     let margin_released = pos.initial_margin * frac;
                     let exec_price = pos.tp1;
@@ -781,36 +884,44 @@ impl PaperTrader {
                         "TP1_PARTIAL",
                         &pos,
                         exec_price,
-                        40.0,
+                        tp1_pct,
                         gross,
                         exit_fee,
                         net_step,
                         free_after,
                         eq_after,
-                        "Closed 40% & Moved SL to Breakeven",
+                        &format!("Closed {:.0}% & Moved SL to Breakeven", tp1_pct),
                     );
 
                     events.push(TradeEventNotification {
-                        title: format!("💰 [PAPER] TP1 แตก! #{} {} (+ปิด 40%)", pos.id, pos.symbol),
+                        title: format!("💰 [PAPER] TP1 แตก! #{} {} (+ปิด {:.0}%)", pos.id, pos.symbol, tp1_pct),
                         symbol: pos.symbol.clone(),
                         lines_th: vec![
                             format!(
-                                "🎯 ชนเป้า TP1 ที่ ${} (เก็บกำไร 40% = {:+.2} USDT)",
+                                "🎯 ชนเป้า TP1 ที่ ${} (เก็บกำไร {:.0}% = {:+.2} USDT) [{}]",
                                 format_price(exec_price),
-                                net_step
+                                tp1_pct,
+                                net_step,
+                                pos_strat.short_tag()
                             ),
                             format!(
                                 "🛡️ เลื่อน SL กันทุน (Breakeven) อัตโนมัติ -> ${}",
                                 format_price(pos.current_sl)
                             ),
-                            format!("💼 เหลือถือรันต่อ 60% ลุ้น TP2 (${}) / TP3 (${}) | Equity ${:.2}", format_price(pos.tp2), format_price(pos.tp3), eq_after),
+                            format!(
+                                "💼 เหลือถือรันต่อ {:.0}% ลุ้น TP2 (${}) / TP3 (${}) | Equity ${:.2}",
+                                remain_after_tp1,
+                                format_price(pos.tp2),
+                                format_price(pos.tp3),
+                                eq_after
+                            ),
                         ],
                         discord_color: 0x00E676,
                     });
                     state_changed = true;
                 }
 
-                // 3. Check TP2 (30% + trail SL to TP1)
+                // 3. Check TP2 (tp2_pct% + trail SL to TP1)
                 let tp2_hit_now = pos.tp1_hit
                     && !pos.tp2_hit
                     && match pos.side {
@@ -819,7 +930,7 @@ impl PaperTrader {
                     };
 
                 if tp2_hit_now {
-                    let frac = 0.30;
+                    let frac = tp2_pct / 100.0;
                     let close_qty = pos.initial_qty * frac;
                     let margin_released = pos.initial_margin * frac;
                     let exec_price = pos.tp2;
@@ -851,36 +962,43 @@ impl PaperTrader {
                         "TP2_PARTIAL",
                         &pos,
                         exec_price,
-                        30.0,
+                        tp2_pct,
                         gross,
                         exit_fee,
                         net_step,
                         free_after,
                         eq_after,
-                        "Closed 30% & Trailed SL to TP1",
+                        &format!("Closed {:.0}% & Trailed SL to TP1", tp2_pct),
                     );
 
                     events.push(TradeEventNotification {
-                        title: format!("🚀 [PAPER] TP2 แตก! #{} {} (+ปิดอีก 30%)", pos.id, pos.symbol),
+                        title: format!("🚀 [PAPER] TP2 แตก! #{} {} (+ปิดอีก {:.0}%)", pos.id, pos.symbol, tp2_pct),
                         symbol: pos.symbol.clone(),
                         lines_th: vec![
                             format!(
-                                "🎯 ชนเป้า TP2 ที่ ${} (เก็บกำไรเพิ่ม 30% = {:+.2} USDT)",
+                                "🎯 ชนเป้า TP2 ที่ ${} (เก็บกำไรเพิ่ม {:.0}% = {:+.2} USDT) [{}]",
                                 format_price(exec_price),
-                                net_step
+                                tp2_pct,
+                                net_step,
+                                pos_strat.short_tag()
                             ),
                             format!(
                                 "🔒 เลื่อน Trailing SL ล็อกกำไรที่ TP1 -> ${}",
                                 format_price(pos.current_sl)
                             ),
-                            format!("💼 เหลือถือรันต่อ 30% ลุ้น TP3 (${}) | Equity ${:.2}", format_price(pos.tp3), eq_after),
+                            format!(
+                                "💼 เหลือถือรันต่อ {:.0}% ลุ้น TP3 (${}) | Equity ${:.2}",
+                                tp3_pct,
+                                format_price(pos.tp3),
+                                eq_after
+                            ),
                         ],
                         discord_color: 0x00E676,
                     });
                     state_changed = true;
                 }
 
-                // 4. Check TP3 (final 30%)
+                // 4. Check TP3 (final remaining fraction / tp3_pct%)
                 let tp3_hit_now = pos.tp2_hit
                     && match pos.side {
                         PaperSide::Long => price >= pos.tp3,
@@ -913,6 +1031,11 @@ impl PaperTrader {
                     } else {
                         st.loss_count += 1;
                     }
+                    record_strategy_closed_trade(
+                        &mut st.strategy_stats,
+                        &pos.strategy,
+                        pos.realized_pnl_trade,
+                    );
 
                     st.open_positions.remove(idx);
                     st.update_drawdown();
@@ -924,7 +1047,7 @@ impl PaperTrader {
                         "TP3_FULL_CLOSE",
                         &pos,
                         exec_price,
-                        30.0,
+                        tp3_pct,
                         gross,
                         exit_fee,
                         net_step,
@@ -938,9 +1061,11 @@ impl PaperTrader {
                         symbol: pos.symbol.clone(),
                         lines_th: vec![
                             format!(
-                                "🎯 ชนเป้า TP3 ที่ ${} (ปิด 30% สุดท้าย = {:+.2} USDT)",
+                                "🎯 ชนเป้า TP3 ที่ ${} (ปิด {:.0}% สุดท้าย = {:+.2} USDT) [{}]",
                                 format_price(exec_price),
-                                net_step
+                                tp3_pct,
+                                net_step,
+                                pos_strat.title_th()
                             ),
                             format!(
                                 "💎 กำไรรวมสุทธิทั้งไม้: {:+.2} USDT (ค่าธรรมเนียมรวม ${:.2})",
@@ -1028,6 +1153,11 @@ impl PaperTrader {
             } else {
                 st.loss_count += 1;
             }
+            record_strategy_closed_trade(
+                &mut st.strategy_stats,
+                &pos.strategy,
+                pos.realized_pnl_trade,
+            );
 
             st.update_drawdown();
             let eq_after = st.total_equity();
@@ -1053,6 +1183,7 @@ impl PaperTrader {
             );
             let _ = self.save_state_sync(&st);
 
+            let pos_strat = TradingStrategy::from_str_lossy(&pos.strategy).unwrap_or_default();
             let icon = if pos.realized_pnl_trade >= 0.0 { "✅" } else { "🛑" };
             let notif = TradeEventNotification {
                 title: format!(
@@ -1061,7 +1192,11 @@ impl PaperTrader {
                 ),
                 symbol: pos.symbol.clone(),
                 lines_th: vec![
-                    format!("📌 สถานะ: {} (ปิดด้วยตนเอง)", pos.side.as_str()),
+                    format!(
+                        "📌 สถานะ: {} (ปิดด้วยตนเอง) | 🎯 {}",
+                        pos.side.as_str(),
+                        pos_strat.title_th()
+                    ),
                     format!(
                         "🎯 Entry: ${} -> Exit: ${}",
                         format_price(pos.entry_price),
@@ -1125,6 +1260,7 @@ impl PaperTrader {
             0.0
         };
 
+        let eff_strat = st.effective_strategy(&self.config);
         let eff_lev = st.effective_leverage(&self.config);
         let eff_pct = st.effective_position_pct(&self.config);
         let eff_max = st.effective_max_open_positions(&self.config);
@@ -1137,7 +1273,8 @@ impl PaperTrader {
             eq, net_pct, st.initial_balance
         );
         info!(
-            "• ตั้งค่าไม้: {:.0}x | ไม้ละ {:.0}% | Max {} ไม้ | >= {} ดาว{}",
+            "• กลยุทธ์: {} | ตั้งค่าไม้: {:.0}x | ไม้ละ {:.0}% | Max {} ไม้ | >= {} ดาว{}",
+            eff_strat.title_th(),
             eff_lev,
             eff_pct,
             eff_max,
@@ -1168,18 +1305,21 @@ impl PaperTrader {
                 eff_max
             );
             for p in &st.open_positions {
+                let remain_pct = (p.remaining_fraction * 100.0).round();
+                let pos_strat = TradingStrategy::from_str_lossy(&p.strategy).unwrap_or_default();
                 let stage = if p.tp2_hit {
-                    "ผ่าน TP1+TP2 (ถือ 30%)"
+                    format!("ผ่าน TP1+TP2 (ถือ {:.0}%)", remain_pct)
                 } else if p.tp1_hit {
-                    "ผ่าน TP1+กันทุน (ถือ 60%)"
+                    format!("ผ่าน TP1+กันทุน (ถือ {:.0}%)", remain_pct)
                 } else {
-                    "รอ TP1 (ถือ 100%)"
+                    "รอ TP1 (ถือ 100%)".to_string()
                 };
                 info!(
-                    "  #{} {} {} | Entry ${} -> Now ${} | uPnL {:+.2} ({:+.1}%) | SL ${} | {}",
+                    "  #{} {} {} [{}] | Entry ${} -> Now ${} | uPnL {:+.2} ({:+.1}%) | SL ${} | {}",
                     p.id,
                     p.side.as_str(),
                     p.symbol,
+                    pos_strat.short_tag(),
                     format_price(p.entry_price),
                     format_price(p.last_price),
                     p.unrealized_pnl(),
@@ -1489,6 +1629,193 @@ mod tests {
         assert!((st_default.effective_position_pct(&cfg) - 10.0).abs() < 1e-6);
         assert!((st_default.effective_leverage(&cfg) - 10.0).abs() < 1e-6);
         assert_eq!(st_default.effective_min_stars(&cfg), 2);
+
+        let _ = fs::remove_file(&cfg.paper_state_file);
+        let _ = fs::remove_file(&cfg.paper_trades_csv);
+    }
+
+    #[tokio::test]
+    async fn test_strategy_switching_min_stars_dynamic_splits_and_stats() {
+        let cfg = test_config("strategy");
+        let notifier = AlertNotifier::new(cfg.clone());
+        let pt = PaperTrader::new(cfg.clone(), notifier);
+
+        // Customize Lev/Size/Max first and switch to TrendFollow -> Min Stars becomes 3 while Lev/Size/Max preserved
+        pt.update_runtime_settings(Some(8), Some(20.0), Some(15.0), None)
+            .await;
+        let st_trend = pt.set_strategy(TradingStrategy::TrendFollow).await;
+        assert_eq!(st_trend.effective_strategy(&cfg), TradingStrategy::TrendFollow);
+        assert_eq!(st_trend.effective_min_stars(&cfg), 3);
+        assert_eq!(st_trend.effective_max_open_positions(&cfg), 8);
+        assert!((st_trend.effective_position_pct(&cfg) - 20.0).abs() < 1e-6);
+        assert!((st_trend.effective_leverage(&cfg) - 15.0).abs() < 1e-6);
+
+        // Manual star override should still work after selecting a strategy
+        let st_manual_stars = pt
+            .update_runtime_settings(None, None, None, Some(2))
+            .await;
+        assert_eq!(st_manual_stars.effective_min_stars(&cfg), 2);
+
+        // Switching to ScalpQuick clears manual star override -> ScalpQuick default (2) while keeping Lev/Size/Max
+        let st_scalp = pt.set_strategy(TradingStrategy::ScalpQuick).await;
+        assert_eq!(st_scalp.effective_strategy(&cfg), TradingStrategy::ScalpQuick);
+        assert_eq!(st_scalp.effective_min_stars(&cfg), 2);
+        assert_eq!(st_scalp.effective_max_open_positions(&cfg), 8);
+        assert!((st_scalp.effective_leverage(&cfg) - 15.0).abs() < 1e-6);
+
+        // Switch back to TrendFollow and open a 3-star position (25% / 35% / 40% splits)
+        pt.set_strategy(TradingStrategy::TrendFollow).await;
+        let levels = MtfTradeLevels {
+            entry_price: 100.0,
+            entry_band: 99.5,
+            sl: 98.0,
+            tp1: 102.0,
+            tp2: 104.0,
+            tp3: 106.0,
+            risk_pct: 2.0,
+            tp1_pct: 2.0,
+            tp2_pct: 4.0,
+            tp3_pct: 6.0,
+        };
+        assert!(pt
+            .try_open_position(
+                "BTCUSDT",
+                SignalDirection::Bullish,
+                SignalCategory::EmaBullishCross,
+                "5m+15m+1h",
+                2,
+                &levels,
+            )
+            .await
+            .is_none());
+
+        let tid_trend = pt
+            .try_open_position(
+                "BTCUSDT",
+                SignalDirection::Bullish,
+                SignalCategory::EmaBullishCross,
+                "5m+15m+1h",
+                3,
+                &levels,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tid_trend, 1);
+
+        // Switch live to ScalpQuick WHILE BTCUSDT position is open; BTCUSDT must retain 25/35/40 splits
+        pt.set_strategy(TradingStrategy::ScalpQuick).await;
+        pt.on_price_tick("BTCUSDT", 102.0).await;
+        {
+            let snap = pt.get_state_snapshot().await;
+            assert_eq!(snap.open_positions[0].strategy, "TREND_FOLLOW");
+            assert!((snap.open_positions[0].remaining_fraction - 0.75).abs() < 1e-6);
+        }
+        pt.on_price_tick("BTCUSDT", 104.0).await;
+        {
+            let snap = pt.get_state_snapshot().await;
+            assert!((snap.open_positions[0].remaining_fraction - 0.40).abs() < 1e-6);
+        }
+        pt.on_price_tick("BTCUSDT", 106.0).await;
+
+        // Open a 2-star ScalpQuick short and stop it out to verify loss tracking in strategy_stats
+        let levels_short = MtfTradeLevels {
+            entry_price: 100.0,
+            entry_band: 100.5,
+            sl: 102.0,
+            tp1: 98.0,
+            tp2: 96.0,
+            tp3: 94.0,
+            risk_pct: 2.0,
+            tp1_pct: 2.0,
+            tp2_pct: 4.0,
+            tp3_pct: 6.0,
+        };
+        let tid_scalp = pt
+            .try_open_position(
+                "ETHUSDT",
+                SignalDirection::Bearish,
+                SignalCategory::PriceDump,
+                "5m+15m+1h",
+                2,
+                &levels_short,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tid_scalp, 2);
+        {
+            let snap = pt.get_state_snapshot().await;
+            assert_eq!(snap.open_positions[0].strategy, "SCALP_QUICK");
+            assert!((snap.open_positions[0].tp1_close_pct - 50.0).abs() < 1e-6);
+            assert!((snap.open_positions[0].tp2_close_pct - 35.0).abs() < 1e-6);
+        }
+        pt.on_price_tick("ETHUSDT", 102.0).await;
+
+        let snap_after = pt.get_state_snapshot().await;
+        assert_eq!(snap_after.open_positions.len(), 0);
+        let trend_stats = snap_after.strategy_stats.get("TREND_FOLLOW").unwrap();
+        assert_eq!(trend_stats.trades, 1);
+        assert_eq!(trend_stats.wins, 1);
+        assert_eq!(trend_stats.losses, 0);
+        assert!(trend_stats.realized_pnl > 0.0);
+
+        let scalp_stats = snap_after.strategy_stats.get("SCALP_QUICK").unwrap();
+        assert_eq!(scalp_stats.trades, 1);
+        assert_eq!(scalp_stats.wins, 0);
+        assert_eq!(scalp_stats.losses, 1);
+        assert!(scalp_stats.realized_pnl < 0.0);
+
+        let csv_rows = pt.recent_csv_events(10);
+        assert!(csv_rows.iter().any(|r| r.strategy == "TREND_FOLLOW"));
+        assert!(csv_rows.iter().any(|r| r.strategy == "SCALP_QUICK"));
+
+        // Portfolio reset clears strategy_stats while preserving custom_strategy
+        let st_reset = pt.reset_portfolio_async().await.unwrap();
+        assert!(st_reset.strategy_stats.is_empty());
+        assert_eq!(st_reset.effective_strategy(&cfg), TradingStrategy::ScalpQuick);
+
+        // Legacy JSON without custom_strategy/strategy_stats/position splits deserializes safely
+        let legacy_json = r#"{
+            "initial_balance": 1000.0,
+            "free_balance": 900.0,
+            "realized_pnl": 0.0,
+            "total_fees": 0.5,
+            "peak_equity": 1000.0,
+            "max_drawdown_pct": 0.0,
+            "next_trade_id": 2,
+            "total_closed": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "open_positions": [{
+                "id": 1,
+                "symbol": "BTCUSDT",
+                "side": "Long",
+                "stars": 3,
+                "signal_category": "RSI_OS",
+                "timeframe": "5m+15m+1h",
+                "entry_price": 100.0,
+                "initial_sl": 98.0,
+                "current_sl": 98.0,
+                "tp1": 102.0,
+                "tp2": 104.0,
+                "tp3": 106.0,
+                "leverage": 10.0,
+                "initial_margin": 100.0,
+                "remaining_margin": 100.0,
+                "initial_qty": 10.0,
+                "remaining_qty": 10.0,
+                "remaining_fraction": 1.0,
+                "tp1_hit": false,
+                "tp2_hit": false,
+                "realized_pnl_trade": -0.5,
+                "fees_paid_trade": 0.5,
+                "last_price": 100.0,
+                "opened_at": "2026-11-16T00:00:00Z"
+            }]
+        }"#;
+        let legacy_state: PaperPortfolioState = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_state.effective_strategy(&cfg), TradingStrategy::Balanced);
+        assert_eq!(legacy_state.open_positions[0].strategy, "BALANCED");
+        assert_eq!(legacy_state.open_positions[0].tp_close_splits(), (40.0, 30.0, 30.0));
 
         let _ = fs::remove_file(&cfg.paper_state_file);
         let _ = fs::remove_file(&cfg.paper_trades_csv);

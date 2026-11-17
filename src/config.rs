@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::strategy::TradingStrategy;
+
 #[derive(Debug, Clone)]
 pub struct ScannerConfig {
     /// Binance Futures REST base URL
@@ -15,6 +17,8 @@ pub struct ScannerConfig {
     pub kline_interval: String,
     /// Number of historical candles to keep in memory per symbol
     pub candle_buffer_size: usize,
+    /// Active preset scanning & paper trading strategy
+    pub scanner_strategy: TradingStrategy,
 
     /// Price Pump/Dump threshold (%) within a single candle
     pub price_change_threshold_pct: f64,
@@ -93,6 +97,9 @@ impl ScannerConfig {
             max_symbols: env_usize("MAX_SYMBOLS", 150),
             kline_interval: env_string("KLINE_INTERVAL", "5m"),
             candle_buffer_size: env_usize("CANDLE_BUFFER_SIZE", 100),
+            scanner_strategy: env_opt_string("SCANNER_STRATEGY")
+                .and_then(|s| TradingStrategy::from_str_lossy(&s))
+                .unwrap_or_default(),
 
             price_change_threshold_pct: env_f64("PRICE_CHANGE_THRESHOLD_PCT", 2.5),
             volume_spike_multiplier: env_f64("VOLUME_SPIKE_MULTIPLIER", 3.5),

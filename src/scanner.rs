@@ -364,6 +364,11 @@ impl FuturesScanner {
             return;
         }
 
+        let (active_strategy, _) = self.paper_trader.get_effective_strategy_and_min_stars().await;
+        if !active_strategy.allows_category(SignalCategory::LargeLiquidation) {
+            return;
+        }
+
         let (change_24h, vol_24h) = self.get_ticker_meta(&order.symbol).await;
 
         // In Binance forceOrder: Side "SELL" means a Long position was force-sold (Long Liquidated -> Bearish pressure)
@@ -391,6 +396,7 @@ impl FuturesScanner {
                 format_compact_usd(usd_val)
             ),
             details: vec![
+                ("🎯 กลยุทธ์".to_string(), active_strategy.title_th().to_string()),
                 ("มูลค่า Liquidation".to_string(), format!("${}", format_compact_usd(usd_val))),
                 ("จำนวน (Qty)".to_string(), format!("{:.4}", order_qty)),
                 ("ราคาเฉลี่ย".to_string(), format!("${}", format_price(order_price))),
@@ -412,6 +418,9 @@ impl FuturesScanner {
         if candles.len() < 5 {
             return signals;
         }
+
+        let (active_strategy, eff_min_stars) =
+            self.paper_trader.get_effective_strategy_and_min_stars().await;
 
         let latest = match candles.last() {
             Some(c) => *c,
@@ -499,6 +508,13 @@ impl FuturesScanner {
 
         // 3. Technical Indicators (evaluated on closed candles to prevent repainting)
         if !check_closed_indicators {
+            signals.retain(|s| active_strategy.allows_category(s.category));
+            if active_strategy.requires_1h_alignment() || eff_min_stars >= 3 {
+                return Vec::new();
+            }
+            for sig in &mut signals {
+                sig.details.push(("🎯 กลยุทธ์".to_string(), active_strategy.title_th().to_string()));
+            }
             return signals;
         }
 
@@ -659,6 +675,8 @@ impl FuturesScanner {
             }
         }
 
+        // Apply active strategy category filter before cooldown/MTF REST calls
+        signals.retain(|s| active_strategy.allows_category(s.category));
         if signals.is_empty() {
             return signals;
         }
@@ -711,7 +729,9 @@ impl FuturesScanner {
                 for mut sig in signals {
                     let is_reversal = matches!(
                         sig.category,
-                        SignalCategory::RsiOverbought | SignalCategory::RsiOversold
+                        SignalCategory::RsiOverbought
+                            | SignalCategory::RsiOversold
+                            | SignalCategory::FundingRateExtreme
                     );
                     let (stars, grade_str, aligned_1h, reasons) = evaluate_mtf_confluence(
                         sig.direction,
@@ -722,7 +742,8 @@ impl FuturesScanner {
                         self.config.rsi_overbought,
                         self.config.rsi_oversold,
                     );
-                    if stars >= 2 {
+                    let passes_1h = !active_strategy.requires_1h_alignment() || aligned_1h;
+                    if stars >= eff_min_stars && passes_1h {
                         sig.timeframe = format!("{}+15m+1h", self.config.kline_interval);
                         if let Some(levels) = append_mtf_trade_plan(
                             &mut sig.details,
@@ -735,6 +756,7 @@ impl FuturesScanner {
                             &grade_str,
                             aligned_1h,
                             &reasons,
+                            active_strategy,
                         ) {
                             self.paper_trader
                                 .try_open_position(
@@ -754,7 +776,13 @@ impl FuturesScanner {
             }
         }
 
+        if active_strategy.requires_1h_alignment() || eff_min_stars >= 3 {
+            return Vec::new();
+        }
+
         for sig in &mut signals {
+            sig.details
+                .push(("🎯 กลยุทธ์".to_string(), active_strategy.title_th().to_string()));
             append_trade_plan(&mut sig.details, sig.direction, sig.price, Some(candles));
         }
 
@@ -763,6 +791,12 @@ impl FuturesScanner {
 
     /// Scans all active symbols for extreme Funding Rates (`/fapi/v1/premiumIndex`).
     async fn scan_funding_rates(&self, active_symbols: &HashSet<String>) -> usize {
+        let (active_strategy, eff_min_stars) =
+            self.paper_trader.get_effective_strategy_and_min_stars().await;
+        if !active_strategy.allows_category(SignalCategory::FundingRateExtreme) {
+            return 0;
+        }
+
         let list = match self.client.fetch_all_premium_index().await {
             Ok(l) => l,
             Err(err) => {
@@ -779,6 +813,14 @@ impl FuturesScanner {
 
             let fr_pct = item.funding_rate_pct();
             if fr_pct.abs() < self.config.funding_rate_threshold_pct {
+                continue;
+            }
+
+            if self
+                .notifier
+                .is_in_cooldown(&item.symbol, SignalCategory::FundingRateExtreme)
+                .await
+            {
                 continue;
             }
 
@@ -802,7 +844,91 @@ impl FuturesScanner {
                 ("Funding Rate".to_string(), format!("{:+.4}%", fr_pct)),
                 ("Mark Price".to_string(), format!("${}", format_price(mark_price))),
             ];
-            append_trade_plan(&mut details, direction, mark_price, None);
+
+            let (res_5m, res_15m, res_1h) = tokio::join!(
+                self.client.fetch_klines(&item.symbol, "5m", 65),
+                self.client.fetch_klines(&item.symbol, "15m", 65),
+                self.client.fetch_klines(&item.symbol, "1h", 65)
+            );
+
+            let mut timeframe_label = "Funding (5m+15m+1h)".to_string();
+            let mut mtf_ready = false;
+
+            if let (Ok(candles_5m), Ok(candles_15m), Ok(candles_1h)) = (res_5m, res_15m, res_1h) {
+                let s5_opt = analyze_timeframe_state(
+                    &candles_5m,
+                    self.config.rsi_period,
+                    self.config.rsi_overbought,
+                    self.config.rsi_oversold,
+                    self.config.volume_lookback,
+                );
+                let s15_opt = analyze_timeframe_state(
+                    &candles_15m,
+                    self.config.rsi_period,
+                    self.config.rsi_overbought,
+                    self.config.rsi_oversold,
+                    self.config.volume_lookback,
+                );
+                let s1h_opt = analyze_timeframe_state(
+                    &candles_1h,
+                    self.config.rsi_period,
+                    self.config.rsi_overbought,
+                    self.config.rsi_oversold,
+                    self.config.volume_lookback,
+                );
+
+                if let (Some(state_5m), Some(state_15m), Some(state_1h)) =
+                    (s5_opt, s15_opt, s1h_opt)
+                {
+                    let (stars, grade_str, aligned_1h, reasons) = evaluate_mtf_confluence(
+                        direction,
+                        true,
+                        &state_5m,
+                        &state_15m,
+                        &state_1h,
+                        self.config.rsi_overbought,
+                        self.config.rsi_oversold,
+                    );
+                    let passes_1h = !active_strategy.requires_1h_alignment() || aligned_1h;
+                    if stars < eff_min_stars || !passes_1h {
+                        continue;
+                    }
+                    if let Some(levels) = append_mtf_trade_plan(
+                        &mut details,
+                        direction,
+                        mark_price,
+                        &state_5m,
+                        &state_15m,
+                        &state_1h,
+                        &candles_15m,
+                        &grade_str,
+                        aligned_1h,
+                        &reasons,
+                        active_strategy,
+                    ) {
+                        self.paper_trader
+                            .try_open_position(
+                                &item.symbol,
+                                direction,
+                                SignalCategory::FundingRateExtreme,
+                                &timeframe_label,
+                                stars,
+                                &levels,
+                            )
+                            .await;
+                    }
+                    mtf_ready = true;
+                }
+            }
+
+            if !mtf_ready {
+                if active_strategy.requires_1h_alignment() || eff_min_stars >= 3 {
+                    continue;
+                }
+                timeframe_label = "Funding".to_string();
+                details.push(("🎯 กลยุทธ์".to_string(), active_strategy.title_th().to_string()));
+                append_trade_plan(&mut details, direction, mark_price, None);
+            }
 
             let sig = ScanSignal {
                 symbol: item.symbol,
@@ -811,7 +937,7 @@ impl FuturesScanner {
                 price: mark_price,
                 change_24h_pct: change_24h,
                 quote_volume_24h: vol_24h,
-                timeframe: "Funding".to_string(),
+                timeframe: timeframe_label,
                 metric_summary: format!("Funding Rate = {:+.4}% ({})", fr_pct, note),
                 details,
                 timestamp: Utc::now(),
@@ -826,6 +952,9 @@ impl FuturesScanner {
 
     /// Polls Open Interest across symbols and detects sudden spikes (`oi_spike_threshold_pct`).
     async fn scan_open_interest(&self, symbols: &[String]) -> usize {
+        let (active_strategy, _) = self.paper_trader.get_effective_strategy_and_min_stars().await;
+        let allow_oi_alerts = active_strategy.allows_category(SignalCategory::OpenInterestSpike);
+
         let semaphore = Arc::new(Semaphore::new(8));
         let mut handles = Vec::with_capacity(symbols.len());
 
@@ -854,6 +983,10 @@ impl FuturesScanner {
                     prev
                 };
 
+                if !allow_oi_alerts {
+                    continue;
+                }
+
                 if let Some(prev_oi) = prev_opt {
                     if prev_oi > 0.0 {
                         let oi_change_pct = ((current_oi - prev_oi) / prev_oi) * 100.0;
@@ -881,6 +1014,7 @@ impl FuturesScanner {
                                     format_compact_usd(oi_usd)
                                 ),
                                 details: vec![
+                                    ("🎯 กลยุทธ์".to_string(), active_strategy.title_th().to_string()),
                                     ("OI Change".to_string(), format!("{:+.2}%", oi_change_pct)),
                                     ("OI ปัจจุบัน (Contracts)".to_string(), format_compact_usd(current_oi)),
                                     ("มูลค่า OI (USDT)".to_string(), format!("${}", format_compact_usd(oi_usd))),
