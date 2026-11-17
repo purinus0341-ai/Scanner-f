@@ -137,9 +137,14 @@ fn print_startup_banner(cfg: &ScannerConfig) {
         format_compact_usd(cfg.min_quote_volume_24h),
         cfg.max_symbols
     );
+    let tf_banner = if cfg.kline_interval == "15m" {
+        "15m".to_string()
+    } else {
+        format!("{} + 15m", cfg.kline_interval)
+    };
     info!(
-        "• Timeframe หลัก   : {} (ย้อนหลัง {} แท่ง)",
-        cfg.kline_interval, cfg.candle_buffer_size
+        "• Timeframe Trigger : {} (ย้อนหลัง {} แท่ง | MTF 5m+15m+1h)",
+        tf_banner, cfg.candle_buffer_size
     );
     info!(
         "• สัญญาณราคา/วอลุ่ม : Pump/Dump >= ±{:.2}% | Volume Spike >= {:.1}x ({} แท่ง)",

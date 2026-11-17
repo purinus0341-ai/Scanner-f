@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,11 +27,42 @@ use crate::notifier::{format_compact_usd, format_price, AlertNotifier};
 use crate::paper_trader::PaperTrader;
 use crate::telegram_bot::TelegramBotController;
 
+const CACHE_1H_TTL_SECS: i64 = 300;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PersistedState {
     pub previous_oi: HashMap<String, f64>,
     pub cooldowns: HashMap<String, i64>,
 }
+
+#[derive(Debug, Default)]
+struct ScanMetrics {
+    ws_5m_ticks: AtomicU64,
+    ws_15m_ticks: AtomicU64,
+    closed_5m_bars: AtomicU64,
+    closed_15m_bars: AtomicU64,
+    raw_triggers: AtomicU64,
+    passed_signals: AtomicU64,
+}
+
+fn upsert_candle(buf: &mut Vec<Candle>, new_candle: Candle, max_len: usize) {
+    if let Some(last) = buf.last_mut() {
+        if last.open_time == new_candle.open_time {
+            *last = new_candle;
+        } else if new_candle.open_time > last.open_time {
+            last.is_closed = true;
+            buf.push(new_candle);
+            if max_len > 0 && buf.len() > max_len {
+                let excess = buf.len() - max_len;
+                buf.drain(0..excess);
+            }
+        }
+    } else {
+        buf.push(new_candle);
+    }
+}
+
+type TimedCandleMap = Arc<RwLock<HashMap<String, (i64, Vec<Candle>)>>>;
 
 pub struct FuturesScanner {
     config: ScannerConfig,
@@ -39,8 +71,11 @@ pub struct FuturesScanner {
     paper_trader: PaperTrader,
     scan_now_notify: Arc<Notify>,
     candles: Arc<RwLock<HashMap<String, Vec<Candle>>>>,
+    candles_15m: Arc<RwLock<HashMap<String, Vec<Candle>>>>,
+    candles_1h_cache: TimedCandleMap,
     tickers: Arc<RwLock<HashMap<String, Ticker24hr>>>,
     previous_oi: Arc<RwLock<HashMap<String, f64>>>,
+    metrics: Arc<ScanMetrics>,
 }
 
 impl FuturesScanner {
@@ -53,8 +88,11 @@ impl FuturesScanner {
             paper_trader,
             scan_now_notify: Arc::new(Notify::new()),
             candles: Arc::new(RwLock::new(HashMap::new())),
+            candles_15m: Arc::new(RwLock::new(HashMap::new())),
+            candles_1h_cache: Arc::new(RwLock::new(HashMap::new())),
             tickers: Arc::new(RwLock::new(HashMap::new())),
             previous_oi: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(ScanMetrics::default()),
         }
     }
 
@@ -104,7 +142,144 @@ impl FuturesScanner {
         }
     }
 
-    /// Initializes the symbol universe, warms up historical klines, and evaluates an initial snapshot.
+    async fn log_scan_heartbeat(&self) {
+        let t5 = self.metrics.ws_5m_ticks.swap(0, Ordering::Relaxed);
+        let t15 = self.metrics.ws_15m_ticks.swap(0, Ordering::Relaxed);
+        let c5 = self.metrics.closed_5m_bars.swap(0, Ordering::Relaxed);
+        let c15 = self.metrics.closed_15m_bars.swap(0, Ordering::Relaxed);
+        let raw = self.metrics.raw_triggers.swap(0, Ordering::Relaxed);
+        let passed = self.metrics.passed_signals.swap(0, Ordering::Relaxed);
+
+        if t5 == 0 && t15 == 0 && c5 == 0 && c15 == 0 && raw == 0 && passed == 0 {
+            return;
+        }
+
+        let (active_strategy, eff_stars) =
+            self.paper_trader.get_effective_strategy_and_min_stars().await;
+        let lock_tag = if active_strategy.requires_1h_alignment() {
+            "+1h"
+        } else {
+            ""
+        };
+        let ws_summary = if self.config.kline_interval == "15m" {
+            format!("WS 15m={} ticks (ปิดแท่ง 15m={})", t15, c15)
+        } else {
+            format!(
+                "WS {}={} / 15m={} ticks (ปิดแท่ง {}={}, 15m={})",
+                self.config.kline_interval, t5, t15, self.config.kline_interval, c5, c15
+            )
+        };
+        info!(
+            "📡 สถานะสแกนล่าสุด [{} | ≥{}⭐{}]: {} | Trigger ตั้งต้น={} -> ผ่านเกณฑ์={}",
+            active_strategy.short_tag(),
+            eff_stars,
+            lock_tag,
+            ws_summary,
+            raw,
+            passed
+        );
+    }
+
+    async fn warmup_interval_buffers(&self, symbols: &[String], interval: &str) -> usize {
+        let semaphore = Arc::new(Semaphore::new(10));
+        let mut join_handles = Vec::with_capacity(symbols.len());
+
+        for sym in symbols {
+            let sem = semaphore.clone();
+            let client = self.client.clone();
+            let symbol = sym.clone();
+            let tf = interval.to_string();
+            let limit = self.config.candle_buffer_size;
+
+            join_handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.ok()?;
+                match client.fetch_klines(&symbol, &tf, limit).await {
+                    Ok(klines) => Some((symbol, klines)),
+                    Err(err) => {
+                        warn!("ดึงข้อมูลแท่งเทียนเริ่มต้น ({}) ของ {} ไม่สำเร็จ: {:#}", tf, symbol, err);
+                        None
+                    }
+                }
+            }));
+        }
+
+        let mut loaded_count = 0usize;
+        let mut loaded_map = HashMap::with_capacity(symbols.len());
+        for handle in join_handles {
+            if let Ok(Some((symbol, klines))) = handle.await {
+                loaded_count += 1;
+                loaded_map.insert(symbol, klines);
+            }
+        }
+
+        if interval == "15m" {
+            let mut guard = self.candles_15m.write().await;
+            for (k, v) in loaded_map {
+                guard.insert(k, v);
+            }
+        } else {
+            let mut guard = self.candles.write().await;
+            for (k, v) in loaded_map {
+                guard.insert(k, v);
+            }
+        }
+
+        loaded_count
+    }
+
+    async fn get_or_fetch_candles_5m(&self, symbol: &str) -> Result<Vec<Candle>> {
+        if self.config.kline_interval == "5m" {
+            let guard = self.candles.read().await;
+            if let Some(buf) = guard.get(symbol) {
+                if buf.len() >= 25 {
+                    return Ok(buf.clone());
+                }
+            }
+        }
+        let fetched = self.client.fetch_klines(symbol, "5m", 65).await?;
+        if self.config.kline_interval == "5m" && !fetched.is_empty() {
+            let mut guard = self.candles.write().await;
+            guard.insert(symbol.to_string(), fetched.clone());
+        }
+        Ok(fetched)
+    }
+
+    async fn get_or_fetch_candles_15m(&self, symbol: &str) -> Result<Vec<Candle>> {
+        {
+            let guard = self.candles_15m.read().await;
+            if let Some(buf) = guard.get(symbol) {
+                if buf.len() >= 25 {
+                    return Ok(buf.clone());
+                }
+            }
+        }
+        let fetched = self.client.fetch_klines(symbol, "15m", 65).await?;
+        if !fetched.is_empty() {
+            let mut guard = self.candles_15m.write().await;
+            guard.insert(symbol.to_string(), fetched.clone());
+        }
+        Ok(fetched)
+    }
+
+    async fn fetch_klines_1h_cached(&self, symbol: &str) -> Result<Vec<Candle>> {
+        let now = Utc::now().timestamp();
+        {
+            let guard = self.candles_1h_cache.read().await;
+            if let Some((fetched_at, buf)) = guard.get(symbol) {
+                if now - *fetched_at < CACHE_1H_TTL_SECS && !buf.is_empty() {
+                    return Ok(buf.clone());
+                }
+            }
+        }
+        let fetched = self.client.fetch_klines(symbol, "1h", 65).await?;
+        if !fetched.is_empty() {
+            let mut guard = self.candles_1h_cache.write().await;
+            guard.insert(symbol.to_string(), (now, fetched.clone()));
+        }
+        Ok(fetched)
+    }
+
+    /// Initializes the symbol universe, warms up historical klines (primary TF + 15m), and evaluates an initial snapshot.
     /// Returns the list of qualified symbols and the number of signals detected during the initial scan.
     pub async fn initialize_and_scan_once(&self, emit_initial_signals: bool) -> Result<(Vec<String>, usize)> {
         self.load_state().await;
@@ -132,53 +307,67 @@ impl FuturesScanner {
             *t_guard = ticker_map;
         }
 
-        // Warm up historical klines concurrently (max 10 requests in flight to respect Binance rate limits)
-        let semaphore = Arc::new(Semaphore::new(10));
-        let mut join_handles = Vec::with_capacity(symbols.len());
+        let scan_15m_extra = self.config.kline_interval != "15m";
+        let loaded_primary = self
+            .warmup_interval_buffers(&symbols, &self.config.kline_interval)
+            .await;
+        info!(
+            "โหลดข้อมูลแท่งเทียนย้อนหลัง ({}) สำเร็จ {}/{} เหรียญ",
+            self.config.kline_interval,
+            loaded_primary,
+            symbols.len()
+        );
 
-        for sym in &symbols {
-            let sem = semaphore.clone();
-            let client = self.client.clone();
-            let symbol = sym.clone();
-            let interval = self.config.kline_interval.clone();
-            let limit = self.config.candle_buffer_size;
-
-            join_handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.ok()?;
-                match client.fetch_klines(&symbol, &interval, limit).await {
-                    Ok(klines) => Some((symbol, klines)),
-                    Err(err) => {
-                        warn!("ดึงข้อมูลแท่งเทียนเริ่มต้นของ {} ไม่สำเร็จ: {:#}", symbol, err);
-                        None
-                    }
-                }
-            }));
+        if scan_15m_extra {
+            let loaded_15m = self.warmup_interval_buffers(&symbols, "15m").await;
+            info!(
+                "โหลดข้อมูลแท่งเทียนย้อนหลัง (15m Trigger) สำเร็จ {}/{} เหรียญ",
+                loaded_15m,
+                symbols.len()
+            );
+        } else {
+            let primary_clone = self.candles.read().await.clone();
+            let mut guard = self.candles_15m.write().await;
+            *guard = primary_clone;
         }
 
-        let mut loaded_count = 0usize;
         let mut signal_count = 0usize;
+        if emit_initial_signals {
+            let snapshot_primary = self.candles.read().await.clone();
+            let snapshot_15m = if scan_15m_extra {
+                Some(self.candles_15m.read().await.clone())
+            } else {
+                None
+            };
 
-        for handle in join_handles {
-            if let Ok(Some((symbol, klines))) = handle.await {
-                loaded_count += 1;
-                if emit_initial_signals {
-                    let signals = self.evaluate_symbol_candles(&symbol, &klines, true).await;
+            for sym in &symbols {
+                if let Some(klines) = snapshot_primary.get(sym) {
+                    let signals = self
+                        .evaluate_symbol_candles_for_tf(
+                            sym,
+                            &self.config.kline_interval,
+                            klines,
+                            true,
+                        )
+                        .await;
                     signal_count += signals.len();
                     for sig in signals {
                         self.notifier.dispatch(sig).await;
                     }
                 }
-                let mut c_guard = self.candles.write().await;
-                c_guard.insert(symbol, klines);
+                if let Some(ref map_15m) = snapshot_15m {
+                    if let Some(klines_15m) = map_15m.get(sym) {
+                        let signals_15m = self
+                            .evaluate_symbol_candles_for_tf(sym, "15m", klines_15m, true)
+                            .await;
+                        signal_count += signals_15m.len();
+                        for sig in signals_15m {
+                            self.notifier.dispatch(sig).await;
+                        }
+                    }
+                }
             }
         }
-
-        info!(
-            "โหลดข้อมูลแท่งเทียนย้อนหลัง ({}) สำเร็จ {}/{} เหรียญ",
-            self.config.kline_interval,
-            loaded_count,
-            symbols.len()
-        );
 
         // Scan Funding Rates & initialize Open Interest baseline
         let active_set: HashSet<String> = symbols.iter().cloned().collect();
@@ -196,7 +385,7 @@ impl FuturesScanner {
         Ok((symbols, signal_count))
     }
 
-    /// Runs the full real-time scanner loop (WebSocket Kline Streams + Liquidation Stream + Futures Metric Poller).
+    /// Runs the full real-time scanner loop (WebSocket Kline Streams for primary TF + 15m + Liquidation Stream + Futures Metric Poller).
     pub async fn run_forever(self: Arc<Self>) -> Result<()> {
         let telegram_bot = self.telegram_bot_controller();
         telegram_bot.clone().spawn_background();
@@ -211,7 +400,7 @@ impl FuturesScanner {
             .send_dashboard_message(false, Some("🚀 เริ่มทำงานสแกนตลาด + จำลองการเทรดแล้ว"))
             .await;
 
-        let (kline_tx, mut kline_rx) = mpsc::channel::<WsKlineEvent>(2048);
+        let (kline_tx, mut kline_rx) = mpsc::channel::<WsKlineEvent>(4096);
         let (liq_tx, mut liq_rx) = mpsc::channel::<WsForceOrderEvent>(1024);
 
         // Split symbols into chunks of 100 per WebSocket connection for stability
@@ -222,6 +411,14 @@ impl FuturesScanner {
                 self.config.kline_interval.clone(),
                 kline_tx.clone(),
             );
+            if self.config.kline_interval != "15m" {
+                spawn_kline_ws_worker(
+                    self.config.ws_base_url.clone(),
+                    chunk.to_vec(),
+                    "15m".to_string(),
+                    kline_tx.clone(),
+                );
+            }
         }
 
         // Spawn All-Market Liquidation stream (!forceOrder@arr)
@@ -266,6 +463,7 @@ impl FuturesScanner {
                 scanner_poller.scan_funding_rates(&active_set).await;
                 scanner_poller.scan_open_interest(&tracked_symbols).await;
                 scanner_poller.save_state().await;
+                scanner_poller.log_scan_heartbeat().await;
                 if scanner_poller.config.paper_trading_enabled {
                     scanner_poller.paper_trader.print_portfolio_summary().await;
                 }
@@ -297,7 +495,15 @@ impl FuturesScanner {
                 }
             }
         } else {
-            info!("🟢 ระบบ Scanner-f กำลังทำงานแบบเรียลไทม์ (กด Ctrl+C เพื่อหยุดการทำงาน)...");
+            let tf_label = if self.config.kline_interval == "15m" {
+                "15m".to_string()
+            } else {
+                format!("{} + 15m", self.config.kline_interval)
+            };
+            info!(
+                "🟢 ระบบ Scanner-f กำลังทำงานแบบเรียลไทม์ ({} Trigger | กด Ctrl+C เพื่อหยุดการทำงาน)...",
+                tf_label
+            );
             loop {
                 tokio::select! {
                     Some(kline_ev) = kline_rx.recv() => {
@@ -315,37 +521,53 @@ impl FuturesScanner {
     }
 
     async fn handle_kline_event(&self, ev: WsKlineEvent) {
+        let interval = ev.kline.interval.clone();
         let new_candle = ev.kline.to_candle();
         let symbol = ev.symbol;
+        let is_primary = interval == self.config.kline_interval;
+        let is_15m = interval == "15m";
 
-        let snapshot = {
+        if !is_primary && !is_15m {
+            return;
+        }
+
+        let snapshot = if is_primary {
+            if !is_15m {
+                self.metrics.ws_5m_ticks.fetch_add(1, Ordering::Relaxed);
+                if new_candle.is_closed {
+                    self.metrics.closed_5m_bars.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let mut guard = self.candles.write().await;
             let buf = guard.entry(symbol.clone()).or_insert_with(Vec::new);
-
-            if let Some(last) = buf.last_mut() {
-                if last.open_time == new_candle.open_time {
-                    *last = new_candle;
-                } else if new_candle.open_time > last.open_time {
-                    last.is_closed = true;
-                    buf.push(new_candle);
-                    if buf.len() > self.config.candle_buffer_size {
-                        let excess = buf.len() - self.config.candle_buffer_size;
-                        buf.drain(0..excess);
-                    }
-                }
-            } else {
-                buf.push(new_candle);
-            }
-
+            upsert_candle(buf, new_candle, self.config.candle_buffer_size);
             buf.clone()
+        } else {
+            Vec::new()
         };
 
-        self.paper_trader
-            .on_price_tick(&symbol, new_candle.close)
-            .await;
+        let snapshot_15m = if is_15m {
+            self.metrics.ws_15m_ticks.fetch_add(1, Ordering::Relaxed);
+            if new_candle.is_closed {
+                self.metrics.closed_15m_bars.fetch_add(1, Ordering::Relaxed);
+            }
+            let mut guard = self.candles_15m.write().await;
+            let buf = guard.entry(symbol.clone()).or_insert_with(Vec::new);
+            upsert_candle(buf, new_candle, self.config.candle_buffer_size);
+            buf.clone()
+        } else {
+            Vec::new()
+        };
 
+        if is_primary {
+            self.paper_trader
+                .on_price_tick(&symbol, new_candle.close)
+                .await;
+        }
+
+        let eval_slice = if is_primary { &snapshot } else { &snapshot_15m };
         let signals = self
-            .evaluate_symbol_candles(&symbol, &snapshot, new_candle.is_closed)
+            .evaluate_symbol_candles_for_tf(&symbol, &interval, eval_slice, new_candle.is_closed)
             .await;
 
         for sig in signals {
@@ -407,10 +629,11 @@ impl FuturesScanner {
         self.notifier.dispatch(signal).await;
     }
 
-    /// Evaluates price action, volume spikes, and technical indicators on a symbol's candle buffer.
-    async fn evaluate_symbol_candles(
+    /// Evaluates price action, volume spikes, and technical indicators on a symbol's candle buffer for a given trigger timeframe.
+    async fn evaluate_symbol_candles_for_tf(
         &self,
         symbol: &str,
+        trigger_tf: &str,
         candles: &[Candle],
         check_closed_indicators: bool,
     ) -> Vec<ScanSignal> {
@@ -428,7 +651,7 @@ impl FuturesScanner {
         };
 
         let (change_24h, vol_24h) = self.get_ticker_meta(symbol).await;
-        let tf = self.config.kline_interval.clone();
+        let tf = trigger_tf;
 
         // 1. Real-time Price Pump / Dump check on current candle
         let candle_chg = latest.change_pct();
@@ -449,7 +672,7 @@ impl FuturesScanner {
                 price: latest.close,
                 change_24h_pct: change_24h,
                 quote_volume_24h: vol_24h,
-                timeframe: tf.clone(),
+                timeframe: tf.to_string(),
                 metric_summary: format!("ราคาพุ่ง +{:.2}% ในแท่ง {}", candle_chg, tf),
                 details,
                 timestamp: Utc::now(),
@@ -469,7 +692,7 @@ impl FuturesScanner {
                 price: latest.close,
                 change_24h_pct: change_24h,
                 quote_volume_24h: vol_24h,
-                timeframe: tf.clone(),
+                timeframe: tf.to_string(),
                 metric_summary: format!("ราคาทุบ {:.2}% ในแท่ง {}", candle_chg, tf),
                 details,
                 timestamp: Utc::now(),
@@ -491,10 +714,10 @@ impl FuturesScanner {
                     price: latest.close,
                     change_24h_pct: change_24h,
                     quote_volume_24h: vol_24h,
-                    timeframe: tf.clone(),
+                    timeframe: tf.to_string(),
                     metric_summary: format!(
-                        "วอลุ่มพุ่ง {:.2} เท่าของค่าเฉลี่ย {} แท่ง ({:+.2}%)",
-                        vol_ratio, self.config.volume_lookback, candle_chg
+                        "[{}] วอลุ่มพุ่ง {:.2} เท่าของค่าเฉลี่ย {} แท่ง ({:+.2}%)",
+                        tf, vol_ratio, self.config.volume_lookback, candle_chg
                     ),
                     details: vec![
                         ("Volume แท่งปัจจุบัน".to_string(), format!("${}", format_compact_usd(latest.quote_volume))),
@@ -509,13 +732,24 @@ impl FuturesScanner {
         // 3. Technical Indicators (evaluated on closed candles to prevent repainting)
         if !check_closed_indicators {
             signals.retain(|s| active_strategy.allows_category(s.category));
-            if active_strategy.requires_1h_alignment() || eff_min_stars >= 3 {
+            if signals.is_empty() || active_strategy.requires_1h_alignment() || eff_min_stars >= 3 {
                 return Vec::new();
             }
-            for sig in &mut signals {
-                sig.details.push(("🎯 กลยุทธ์".to_string(), active_strategy.title_th().to_string()));
+            let mut active_signals = Vec::with_capacity(signals.len());
+            for mut sig in signals {
+                if !self.notifier.is_in_cooldown(&sig.symbol, sig.category).await {
+                    sig.details
+                        .push(("🎯 กลยุทธ์".to_string(), active_strategy.title_th().to_string()));
+                    append_trade_plan(&mut sig.details, sig.direction, sig.price, Some(candles));
+                    active_signals.push(sig);
+                }
             }
-            return signals;
+            if !active_signals.is_empty() {
+                let count = active_signals.len() as u64;
+                self.metrics.raw_triggers.fetch_add(count, Ordering::Relaxed);
+                self.metrics.passed_signals.fetch_add(count, Ordering::Relaxed);
+            }
+            return active_signals;
         }
 
         // Use completed candles for indicator evaluation
@@ -538,10 +772,10 @@ impl FuturesScanner {
                     price: eval_price,
                     change_24h_pct: change_24h,
                     quote_volume_24h: vol_24h,
-                    timeframe: tf.clone(),
+                    timeframe: tf.to_string(),
                     metric_summary: format!(
-                        "RSI({}) = {:.2} (Overbought >= {:.0})",
-                        self.config.rsi_period, rsi, self.config.rsi_overbought
+                        "[{}] RSI({}) = {:.2} (Overbought >= {:.0})",
+                        tf, self.config.rsi_period, rsi, self.config.rsi_overbought
                     ),
                     details: vec![
                         (format!("RSI({})", self.config.rsi_period), format!("{:.2}", rsi)),
@@ -557,10 +791,10 @@ impl FuturesScanner {
                     price: eval_price,
                     change_24h_pct: change_24h,
                     quote_volume_24h: vol_24h,
-                    timeframe: tf.clone(),
+                    timeframe: tf.to_string(),
                     metric_summary: format!(
-                        "RSI({}) = {:.2} (Oversold <= {:.0})",
-                        self.config.rsi_period, rsi, self.config.rsi_oversold
+                        "[{}] RSI({}) = {:.2} (Oversold <= {:.0})",
+                        tf, self.config.rsi_period, rsi, self.config.rsi_oversold
                     ),
                     details: vec![
                         (format!("RSI({})", self.config.rsi_period), format!("{:.2}", rsi)),
@@ -586,10 +820,10 @@ impl FuturesScanner {
                         price: eval_price,
                         change_24h_pct: change_24h,
                         quote_volume_24h: vol_24h,
-                        timeframe: tf.clone(),
+                        timeframe: tf.to_string(),
                         metric_summary: format!(
-                            "EMA({}) ตัดขึ้นเหนือ EMA({}) (Golden Cross)",
-                            self.config.ema_fast_period, self.config.ema_slow_period
+                            "[{}] EMA({}) ตัดขึ้นเหนือ EMA({}) (Golden Cross)",
+                            tf, self.config.ema_fast_period, self.config.ema_slow_period
                         ),
                         details: vec![
                             (format!("EMA({})", self.config.ema_fast_period), format_price(ema_res.fast_now)),
@@ -606,10 +840,10 @@ impl FuturesScanner {
                         price: eval_price,
                         change_24h_pct: change_24h,
                         quote_volume_24h: vol_24h,
-                        timeframe: tf.clone(),
+                        timeframe: tf.to_string(),
                         metric_summary: format!(
-                            "EMA({}) ตัดลงต่ำกว่า EMA({}) (Death Cross)",
-                            self.config.ema_fast_period, self.config.ema_slow_period
+                            "[{}] EMA({}) ตัดลงต่ำกว่า EMA({}) (Death Cross)",
+                            tf, self.config.ema_fast_period, self.config.ema_slow_period
                         ),
                         details: vec![
                             (format!("EMA({})", self.config.ema_fast_period), format_price(ema_res.fast_now)),
@@ -638,10 +872,10 @@ impl FuturesScanner {
                     price: eval_price,
                     change_24h_pct: change_24h,
                     quote_volume_24h: vol_24h,
-                    timeframe: tf.clone(),
+                    timeframe: tf.to_string(),
                     metric_summary: format!(
-                        "ราคาปิดทะลุ Upper Bollinger Band พร้อมวอลุ่ม {:.2}x",
-                        eval_vol_ratio
+                        "[{}] ราคาปิดทะลุ Upper Bollinger Band พร้อมวอลุ่ม {:.2}x",
+                        tf, eval_vol_ratio
                     ),
                     details: vec![
                         ("Upper Band".to_string(), format!("${}", format_price(bb.upper))),
@@ -659,10 +893,10 @@ impl FuturesScanner {
                     price: eval_price,
                     change_24h_pct: change_24h,
                     quote_volume_24h: vol_24h,
-                    timeframe: tf,
+                    timeframe: tf.to_string(),
                     metric_summary: format!(
-                        "ราคาปิดหลุด Lower Bollinger Band พร้อมวอลุ่ม {:.2}x",
-                        eval_vol_ratio
+                        "[{}] ราคาปิดหลุด Lower Bollinger Band พร้อมวอลุ่ม {:.2}x",
+                        tf, eval_vol_ratio
                     ),
                     details: vec![
                         ("Lower Band".to_string(), format!("${}", format_price(bb.lower))),
@@ -675,13 +909,19 @@ impl FuturesScanner {
             }
         }
 
-        // Apply active strategy category filter before cooldown/MTF REST calls
+        if !signals.is_empty() {
+            self.metrics
+                .raw_triggers
+                .fetch_add(signals.len() as u64, Ordering::Relaxed);
+        }
+
+        // Apply active strategy category filter before cooldown/MTF lookup
         signals.retain(|s| active_strategy.allows_category(s.category));
         if signals.is_empty() {
             return signals;
         }
 
-        // Filter out signals still inside cooldown before issuing 15m/1h REST requests or opening paper positions
+        // Filter out signals still inside cooldown before fetching 1h/MTF context or opening paper positions
         let mut active_signals = Vec::with_capacity(signals.len());
         for sig in signals {
             if !self.notifier.is_in_cooldown(&sig.symbol, sig.category).await {
@@ -693,15 +933,36 @@ impl FuturesScanner {
         }
         let mut signals = active_signals;
 
-        // Fetch 15m and 1h candles concurrently for Multi-Timeframe Confluence (5m + 15m + 1h)
-        let (res_15m, res_1h) = tokio::join!(
-            self.client.fetch_klines(symbol, "15m", 65),
-            self.client.fetch_klines(symbol, "1h", 65)
-        );
+        // Reuse in-memory 5m/15m buffers and 300s-cached 1h candles for Multi-Timeframe Confluence
+        let (res_5m, res_15m, res_1h) = if trigger_tf == "15m" {
+            let (r5, r1h) = tokio::join!(
+                self.get_or_fetch_candles_5m(symbol),
+                self.fetch_klines_1h_cached(symbol)
+            );
+            (r5, Ok(candles.to_vec()), r1h)
+        } else if trigger_tf == "5m" {
+            let (r15, r1h) = tokio::join!(
+                self.get_or_fetch_candles_15m(symbol),
+                self.fetch_klines_1h_cached(symbol)
+            );
+            (Ok(candles.to_vec()), r15, r1h)
+        } else {
+            tokio::join!(
+                self.get_or_fetch_candles_5m(symbol),
+                self.get_or_fetch_candles_15m(symbol),
+                self.fetch_klines_1h_cached(symbol)
+            )
+        };
 
-        if let (Ok(candles_15m), Ok(candles_1h)) = (res_15m, res_1h) {
+        let mtf_label = if trigger_tf == "15m" {
+            "15m+5m+1h".to_string()
+        } else {
+            format!("{}+15m+1h", trigger_tf)
+        };
+
+        if let (Ok(candles_5m), Ok(candles_15m), Ok(candles_1h)) = (res_5m, res_15m, res_1h) {
             let state_5m_opt = analyze_timeframe_state(
-                candles,
+                &candles_5m,
                 self.config.rsi_period,
                 self.config.rsi_overbought,
                 self.config.rsi_oversold,
@@ -744,7 +1005,7 @@ impl FuturesScanner {
                     );
                     let passes_1h = !active_strategy.requires_1h_alignment() || aligned_1h;
                     if stars >= eff_min_stars && passes_1h {
-                        sig.timeframe = format!("{}+15m+1h", self.config.kline_interval);
+                        sig.timeframe = mtf_label.clone();
                         if let Some(levels) = append_mtf_trade_plan(
                             &mut sig.details,
                             sig.direction,
@@ -772,6 +1033,11 @@ impl FuturesScanner {
                         mtf_filtered.push(sig);
                     }
                 }
+                if !mtf_filtered.is_empty() {
+                    self.metrics
+                        .passed_signals
+                        .fetch_add(mtf_filtered.len() as u64, Ordering::Relaxed);
+                }
                 return mtf_filtered;
             }
         }
@@ -786,6 +1052,11 @@ impl FuturesScanner {
             append_trade_plan(&mut sig.details, sig.direction, sig.price, Some(candles));
         }
 
+        if !signals.is_empty() {
+            self.metrics
+                .passed_signals
+                .fetch_add(signals.len() as u64, Ordering::Relaxed);
+        }
         signals
     }
 
@@ -846,9 +1117,9 @@ impl FuturesScanner {
             ];
 
             let (res_5m, res_15m, res_1h) = tokio::join!(
-                self.client.fetch_klines(&item.symbol, "5m", 65),
-                self.client.fetch_klines(&item.symbol, "15m", 65),
-                self.client.fetch_klines(&item.symbol, "1h", 65)
+                self.get_or_fetch_candles_5m(&item.symbol),
+                self.get_or_fetch_candles_15m(&item.symbol),
+                self.fetch_klines_1h_cached(&item.symbol)
             );
 
             let mut timeframe_label = "Funding (5m+15m+1h)".to_string();
@@ -1059,5 +1330,352 @@ impl FuturesScanner {
             .get(symbol)
             .map(|t| t.last_price_f64())
             .unwrap_or(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::WsKlineData;
+    use crate::strategy::TradingStrategy;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_scanner_config(tag: &str, strategy: TradingStrategy) -> ScannerConfig {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir();
+        let mut cfg = ScannerConfig::from_env();
+        cfg.kline_interval = "5m".to_string();
+        cfg.candle_buffer_size = 100;
+        cfg.scanner_strategy = strategy;
+        cfg.price_change_threshold_pct = 2.5;
+        cfg.volume_spike_multiplier = 3.5;
+        cfg.volume_lookback = 20;
+        cfg.rsi_period = 14;
+        cfg.rsi_overbought = 75.0;
+        cfg.rsi_oversold = 25.0;
+        cfg.ema_fast_period = 9;
+        cfg.ema_slow_period = 21;
+        cfg.bb_period = 20;
+        cfg.bb_std_dev = 2.0;
+        cfg.bb_min_volume_ratio = 1.8;
+        cfg.alert_cooldown_secs = 900;
+        cfg.state_file = tmp
+            .join(format!("scanner_f_state_{}_{}.json", tag, nanos))
+            .to_string_lossy()
+            .into_owned();
+        cfg.paper_trading_enabled = true;
+        cfg.paper_initial_balance = 1000.0;
+        cfg.paper_leverage = 10.0;
+        cfg.paper_position_pct = 10.0;
+        cfg.paper_max_open_positions = 5;
+        cfg.paper_min_stars = 2;
+        cfg.paper_taker_fee_pct = 0.05;
+        cfg.paper_notify_webhooks = false;
+        cfg.paper_telegram_bot_enabled = false;
+        cfg.paper_state_file = tmp
+            .join(format!("scanner_f_paper_{}_{}.json", tag, nanos))
+            .to_string_lossy()
+            .into_owned();
+        cfg.paper_trades_csv = tmp
+            .join(format!("scanner_f_paper_{}_{}.csv", tag, nanos))
+            .to_string_lossy()
+            .into_owned();
+        cfg.telegram_bot_token = None;
+        cfg.telegram_chat_id = None;
+        cfg.discord_webhook_url = None;
+        cfg
+    }
+
+    fn make_candle(open_time: i64, open: f64, close: f64, is_closed: bool) -> Candle {
+        let high = open.max(close) + 0.15;
+        let low = (open.min(close) - 0.15).max(0.01);
+        Candle {
+            open_time,
+            open,
+            high,
+            low,
+            close,
+            volume: 1_000_000.0 / close.max(1e-6),
+            quote_volume: 1_000_000.0,
+            is_closed,
+        }
+    }
+
+    fn build_bullish_steady_candles(count: usize, step_ms: i64) -> Vec<Candle> {
+        let mut candles = Vec::with_capacity(count);
+        let mut price = 100.0;
+        for i in 0..count {
+            let delta = if i % 2 == 0 { 0.35 } else { -0.20 };
+            let open = price;
+            price += delta;
+            candles.push(make_candle(
+                (i as i64 + 1) * step_ms,
+                open,
+                price,
+                true,
+            ));
+        }
+        // End on an upward step so close >= ema21 and ema9 > ema21
+        if candles.last().is_some_and(|c| c.close < c.open) {
+            let last_open = candles.last().unwrap().close;
+            candles.push(make_candle(
+                (count as i64 + 1) * step_ms,
+                last_open,
+                last_open + 0.35,
+                true,
+            ));
+        }
+        candles
+    }
+
+    fn build_bearish_steady_candles(count: usize, step_ms: i64) -> Vec<Candle> {
+        let mut candles = Vec::with_capacity(count);
+        let mut price = 120.0;
+        for i in 0..count {
+            let delta = if i % 2 == 0 { -0.35 } else { 0.20 };
+            let open = price;
+            price += delta;
+            candles.push(make_candle(
+                (i as i64 + 1) * step_ms,
+                open,
+                price,
+                true,
+            ));
+        }
+        if candles.last().is_some_and(|c| c.close > c.open) {
+            let last_open = candles.last().unwrap().close;
+            candles.push(make_candle(
+                (count as i64 + 1) * step_ms,
+                last_open,
+                last_open - 0.35,
+                true,
+            ));
+        }
+        candles
+    }
+
+    fn build_bullish_ema_cross_candles(step_ms: i64) -> Vec<Candle> {
+        let mut closes = Vec::with_capacity(60);
+        for i in 0..26 {
+            let c = if i % 2 == 0 { 105.3 } else { 104.7 };
+            closes.push(c);
+        }
+        let mut price = 105.0;
+        for i in 0..30 {
+            price += if i % 2 == 0 { -0.5 } else { 0.3 };
+            closes.push(price);
+        }
+        closes.push(102.7);
+        closes.push(103.4);
+        closes.push(104.2);
+        closes.push(105.6);
+
+        let mut candles = Vec::with_capacity(closes.len());
+        let mut prev_close = closes[0];
+        for (i, &c) in closes.iter().enumerate() {
+            candles.push(make_candle(
+                (i as i64 + 1) * step_ms,
+                prev_close,
+                c,
+                true,
+            ));
+            prev_close = c;
+        }
+        candles
+    }
+
+    fn build_rsi_oversold_candles(step_ms: i64) -> Vec<Candle> {
+        let mut candles = Vec::with_capacity(60);
+        let mut price = 120.0;
+        for i in 0..60 {
+            let open = price;
+            price -= 0.45;
+            candles.push(make_candle(
+                (i as i64 + 1) * step_ms,
+                open,
+                price,
+                true,
+            ));
+        }
+        candles
+    }
+
+    #[test]
+    fn test_upsert_candle_update_rollover_and_truncation() {
+        let mut buf = Vec::new();
+        upsert_candle(&mut buf, make_candle(1000, 10.0, 10.5, false), 3);
+        assert_eq!(buf.len(), 1);
+        assert!(!buf[0].is_closed);
+
+        // In-place update for same open_time
+        upsert_candle(&mut buf, make_candle(1000, 10.0, 11.2, false), 3);
+        assert_eq!(buf.len(), 1);
+        assert!((buf[0].close - 11.2).abs() < 1e-9);
+
+        // Stale candle with earlier open_time is ignored
+        upsert_candle(&mut buf, make_candle(500, 9.0, 9.5, true), 3);
+        assert_eq!(buf.len(), 1);
+
+        // Newer candle marks previous closed and appends
+        upsert_candle(&mut buf, make_candle(2000, 11.2, 11.8, false), 3);
+        assert_eq!(buf.len(), 2);
+        assert!(buf[0].is_closed);
+        assert!(!buf[1].is_closed);
+
+        // Exceeding max_len truncates oldest entries
+        upsert_candle(&mut buf, make_candle(3000, 11.8, 12.0, false), 3);
+        upsert_candle(&mut buf, make_candle(4000, 12.0, 12.4, false), 3);
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf[0].open_time, 2000);
+        assert_eq!(buf[2].open_time, 4000);
+    }
+
+    #[tokio::test]
+    async fn test_handle_kline_event_routes_5m_and_15m_buffers_and_metrics() {
+        let cfg = test_scanner_config("ws_route", TradingStrategy::TrendFollow);
+        let notifier = AlertNotifier::new(cfg.clone());
+        let pt = PaperTrader::new(cfg.clone(), notifier.clone());
+        let scanner = FuturesScanner::new(cfg.clone(), notifier, pt);
+
+        scanner
+            .handle_kline_event(WsKlineEvent {
+                symbol: "BTCUSDT".to_string(),
+                kline: WsKlineData {
+                    open_time: 1000,
+                    close_time: 1299,
+                    interval: "5m".to_string(),
+                    open: "100.0".to_string(),
+                    close: "100.5".to_string(),
+                    high: "100.6".to_string(),
+                    low: "99.9".to_string(),
+                    volume: "10.0".to_string(),
+                    quote_volume: "1000.0".to_string(),
+                    is_closed: true,
+                },
+            })
+            .await;
+
+        scanner
+            .handle_kline_event(WsKlineEvent {
+                symbol: "BTCUSDT".to_string(),
+                kline: WsKlineData {
+                    open_time: 2000,
+                    close_time: 2899,
+                    interval: "15m".to_string(),
+                    open: "100.0".to_string(),
+                    close: "101.0".to_string(),
+                    high: "101.2".to_string(),
+                    low: "99.8".to_string(),
+                    volume: "20.0".to_string(),
+                    quote_volume: "2000.0".to_string(),
+                    is_closed: false,
+                },
+            })
+            .await;
+
+        assert_eq!(scanner.metrics.ws_5m_ticks.load(Ordering::Relaxed), 1);
+        assert_eq!(scanner.metrics.closed_5m_bars.load(Ordering::Relaxed), 1);
+        assert_eq!(scanner.metrics.ws_15m_ticks.load(Ordering::Relaxed), 1);
+        assert_eq!(scanner.metrics.closed_15m_bars.load(Ordering::Relaxed), 0);
+
+        {
+            let g5 = scanner.candles.read().await;
+            assert_eq!(g5.get("BTCUSDT").map(|v| v.len()), Some(1));
+        }
+        {
+            let g15 = scanner.candles_15m.read().await;
+            assert_eq!(g15.get("BTCUSDT").map(|v| v.len()), Some(1));
+        }
+
+        let _ = fs::remove_file(&cfg.state_file);
+        let _ = fs::remove_file(&cfg.paper_state_file);
+        let _ = fs::remove_file(&cfg.paper_trades_csv);
+    }
+
+    #[tokio::test]
+    async fn test_15m_trigger_trend_follow_mtf_cooldown_and_filters() {
+        let cfg = test_scanner_config("tf15m", TradingStrategy::TrendFollow);
+        let notifier = AlertNotifier::new(cfg.clone());
+        let pt = PaperTrader::new(cfg.clone(), notifier.clone());
+        let scanner = FuturesScanner::new(cfg.clone(), notifier, pt);
+
+        let candles_5m = build_bullish_steady_candles(60, 300_000);
+        let candles_15m_cross = build_bullish_ema_cross_candles(900_000);
+        let candles_1h_bull = build_bullish_steady_candles(60, 3_600_000);
+        let candles_1h_bear = build_bearish_steady_candles(60, 3_600_000);
+        let candles_15m_oversold = build_rsi_oversold_candles(900_000);
+
+        let closes_15m: Vec<f64> = candles_15m_cross.iter().map(|c| c.close).collect();
+        let ema_check = detect_ema_crossover(&closes_15m, 9, 21).unwrap();
+        assert_eq!(ema_check.crossover, Some(CrossoverType::Bullish));
+
+        let now_ts = Utc::now().timestamp();
+        {
+            let mut g5 = scanner.candles.write().await;
+            g5.insert("BTCUSDT".to_string(), candles_5m.clone());
+            g5.insert("ETHUSDT".to_string(), candles_5m.clone());
+            g5.insert("SOLUSDT".to_string(), candles_5m);
+        }
+        {
+            let mut g1h = scanner.candles_1h_cache.write().await;
+            g1h.insert("BTCUSDT".to_string(), (now_ts, candles_1h_bull.clone()));
+            g1h.insert("ETHUSDT".to_string(), (now_ts, candles_1h_bear));
+            g1h.insert("SOLUSDT".to_string(), (now_ts, candles_1h_bull));
+        }
+
+        // 1) Aligned 1h + 3 stars on 15m EMA Golden Cross passes TrendFollow and opens paper trade
+        let passed_btc = scanner
+            .evaluate_symbol_candles_for_tf("BTCUSDT", "15m", &candles_15m_cross, true)
+            .await;
+        assert_eq!(passed_btc.len(), 1);
+        assert_eq!(passed_btc[0].category, SignalCategory::EmaBullishCross);
+        assert_eq!(passed_btc[0].timeframe, "15m+5m+1h");
+        assert!(passed_btc[0].metric_summary.contains("[15m]"));
+        assert_eq!(scanner.metrics.raw_triggers.load(Ordering::Relaxed), 1);
+        assert_eq!(scanner.metrics.passed_signals.load(Ordering::Relaxed), 1);
+
+        // Dispatch records cooldown; verify TREND_FOLLOW paper trade opened with 25/35/40 splits
+        scanner
+            .notifier
+            .dispatch(passed_btc.into_iter().next().unwrap())
+            .await;
+        let snap = scanner.paper_trader.get_state_snapshot().await;
+        assert_eq!(snap.open_positions.len(), 1);
+        assert_eq!(snap.open_positions[0].symbol, "BTCUSDT");
+        assert_eq!(snap.open_positions[0].strategy, "TREND_FOLLOW");
+        assert_eq!(snap.open_positions[0].timeframe, "15m+5m+1h");
+        assert_eq!(snap.open_positions[0].stars, 3);
+        assert_eq!(snap.open_positions[0].tp_close_splits(), (25.0, 35.0, 40.0));
+
+        // 2) Immediate re-evaluation hits cooldown without duplicating signals or paper trades
+        let duplicate_btc = scanner
+            .evaluate_symbol_candles_for_tf("BTCUSDT", "15m", &candles_15m_cross, true)
+            .await;
+        assert!(duplicate_btc.is_empty());
+        assert_eq!(scanner.metrics.passed_signals.load(Ordering::Relaxed), 1);
+
+        // 3) Bearish 1h blocks 15m bullish EMA cross under TrendFollow (requires 1h alignment)
+        let blocked_eth = scanner
+            .evaluate_symbol_candles_for_tf("ETHUSDT", "15m", &candles_15m_cross, true)
+            .await;
+        assert!(blocked_eth.is_empty());
+        assert_eq!(scanner.paper_trader.get_state_snapshot().await.open_positions.len(), 1);
+        assert_eq!(scanner.metrics.passed_signals.load(Ordering::Relaxed), 1);
+
+        // 4) Non-TrendFollow trigger (RsiOversold) is filtered out by TrendFollow strategy category gate
+        let filtered_sol = scanner
+            .evaluate_symbol_candles_for_tf("SOLUSDT", "15m", &candles_15m_oversold, true)
+            .await;
+        assert!(filtered_sol.is_empty());
+        assert_eq!(scanner.metrics.passed_signals.load(Ordering::Relaxed), 1);
+        assert!(scanner.metrics.raw_triggers.load(Ordering::Relaxed) >= 4);
+
+        let _ = fs::remove_file(&cfg.state_file);
+        let _ = fs::remove_file(&cfg.paper_state_file);
+        let _ = fs::remove_file(&cfg.paper_trades_csv);
     }
 }
