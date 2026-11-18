@@ -24,9 +24,13 @@ if command -v pkg >/dev/null 2>&1; then
     fi
 fi
 
-# 2. ดาวน์โหลดหรืออัปเดตโปรเจกต์
+# 2. ดาวน์โหลดหรืออัปเดตโปรเจกต์อัตโนมัติ
 if [ -f "Cargo.toml" ] && grep -q 'name = "scanner-f"' Cargo.toml 2>/dev/null; then
     INSTALL_DIR="$(pwd)"
+    if [ -d ".git" ]; then
+        echo "🔄 กำลังอัปเดตโค้ดล่าสุดจาก GitHub..."
+        git pull --ff-only || true
+    fi
 else
     if [ ! -d "$INSTALL_DIR/.git" ]; then
         echo "⬇️ กำลังดาวน์โหลด Scanner-f ไปยัง $INSTALL_DIR ..."
@@ -36,6 +40,32 @@ else
         git -C "$INSTALL_DIR" pull --ff-only || true
     fi
     cd "$INSTALL_DIR"
+fi
+
+# 2.5 สร้างปุ่มลัดกดทีเดียว (Termux:Widget บนหน้าจอมือถือ + คำสั่งสั้น scan / scan-rust)
+if command -v pkg >/dev/null 2>&1 || [ -n "${TERMUX_VERSION:-}" ]; then
+    mkdir -p "$HOME/.shortcuts"
+    cat > "$HOME/.shortcuts/Scanner-Rust.sh" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+cd "$INSTALL_DIR" && exec ./termux-run.sh 2
+EOF
+    cat > "$HOME/.shortcuts/Scanner-Fast.sh" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+cd "$INSTALL_DIR" && exec ./termux-run.sh 1
+EOF
+    chmod +x "$HOME/.shortcuts/Scanner-Rust.sh" "$HOME/.shortcuts/Scanner-Fast.sh"
+
+    if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/bin" ] && [ -w "$PREFIX/bin" ]; then
+        cat > "$PREFIX/bin/scan-rust" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+cd "$INSTALL_DIR" && exec ./termux-run.sh 2
+EOF
+        cat > "$PREFIX/bin/scan" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+cd "$INSTALL_DIR" && exec ./termux-run.sh 1
+EOF
+        chmod +x "$PREFIX/bin/scan-rust" "$PREFIX/bin/scan"
+    fi
 fi
 
 # 3. ฟังก์ชันตั้งค่า .env แบบถาม-ตอบบนมือถือ
