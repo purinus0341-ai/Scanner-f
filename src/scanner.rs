@@ -28,6 +28,8 @@ use crate::paper_trader::PaperTrader;
 use crate::telegram_bot::TelegramBotController;
 
 const CACHE_1H_TTL_SECS: i64 = 300;
+const MID_CANDLE_MTF_THROTTLE_SECS: i64 = 30;
+const VOLUME_SPIKE_MIN_MOVE_PCT: f64 = 0.6;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -73,6 +75,7 @@ pub struct FuturesScanner {
     candles: Arc<RwLock<HashMap<String, Vec<Candle>>>>,
     candles_15m: Arc<RwLock<HashMap<String, Vec<Candle>>>>,
     candles_1h_cache: TimedCandleMap,
+    mid_candle_throttle: Arc<RwLock<HashMap<String, i64>>>,
     tickers: Arc<RwLock<HashMap<String, Ticker24hr>>>,
     previous_oi: Arc<RwLock<HashMap<String, f64>>>,
     metrics: Arc<ScanMetrics>,
@@ -90,6 +93,7 @@ impl FuturesScanner {
             candles: Arc::new(RwLock::new(HashMap::new())),
             candles_15m: Arc::new(RwLock::new(HashMap::new())),
             candles_1h_cache: Arc::new(RwLock::new(HashMap::new())),
+            mid_candle_throttle: Arc::new(RwLock::new(HashMap::new())),
             tickers: Arc::new(RwLock::new(HashMap::new())),
             previous_oi: Arc::new(RwLock::new(HashMap::new())),
             metrics: Arc::new(ScanMetrics::default()),
@@ -279,6 +283,68 @@ impl FuturesScanner {
         Ok(fetched)
     }
 
+    async fn should_allow_mid_candle_eval(
+        &self,
+        symbol: &str,
+        trigger_tf: &str,
+        category: SignalCategory,
+    ) -> bool {
+        let now = Utc::now().timestamp();
+        let key = format!("{}:{}:{}", symbol, trigger_tf, category.as_key());
+        let mut guard = self.mid_candle_throttle.write().await;
+        if let Some(&last_ts) = guard.get(&key) {
+            if now - last_ts < MID_CANDLE_MTF_THROTTLE_SECS {
+                return false;
+            }
+        }
+        if guard.len() > 2048 {
+            guard.retain(|_, &mut ts| now - ts < MID_CANDLE_MTF_THROTTLE_SECS * 4);
+        }
+        guard.insert(key, now);
+        true
+    }
+
+    /// Re-evaluates in-memory 5m and 15m candle buffers against current MTF states (mirrors Python's 60s MTF sweep without extra 5m/15m REST calls).
+    pub async fn rescan_cached_mtf_buffers(&self, symbols: &[String]) -> usize {
+        let scan_15m_extra = self.config.kline_interval != "15m";
+        let snapshot_primary = self.candles.read().await.clone();
+        let snapshot_15m = if scan_15m_extra {
+            Some(self.candles_15m.read().await.clone())
+        } else {
+            None
+        };
+
+        let mut signal_count = 0usize;
+        for sym in symbols {
+            if let Some(klines) = snapshot_primary.get(sym) {
+                let signals = self
+                    .evaluate_symbol_candles_for_tf(
+                        sym,
+                        &self.config.kline_interval,
+                        klines,
+                        true,
+                    )
+                    .await;
+                signal_count += signals.len();
+                for sig in signals {
+                    self.notifier.dispatch(sig).await;
+                }
+            }
+            if let Some(ref map_15m) = snapshot_15m {
+                if let Some(klines_15m) = map_15m.get(sym) {
+                    let signals_15m = self
+                        .evaluate_symbol_candles_for_tf(sym, "15m", klines_15m, true)
+                        .await;
+                    signal_count += signals_15m.len();
+                    for sig in signals_15m {
+                        self.notifier.dispatch(sig).await;
+                    }
+                }
+            }
+        }
+        signal_count
+    }
+
     /// Initializes the symbol universe, warms up historical klines (primary TF + 15m), and evaluates an initial snapshot.
     /// Returns the list of qualified symbols and the number of signals detected during the initial scan.
     pub async fn initialize_and_scan_once(&self, emit_initial_signals: bool) -> Result<(Vec<String>, usize)> {
@@ -333,40 +399,7 @@ impl FuturesScanner {
 
         let mut signal_count = 0usize;
         if emit_initial_signals {
-            let snapshot_primary = self.candles.read().await.clone();
-            let snapshot_15m = if scan_15m_extra {
-                Some(self.candles_15m.read().await.clone())
-            } else {
-                None
-            };
-
-            for sym in &symbols {
-                if let Some(klines) = snapshot_primary.get(sym) {
-                    let signals = self
-                        .evaluate_symbol_candles_for_tf(
-                            sym,
-                            &self.config.kline_interval,
-                            klines,
-                            true,
-                        )
-                        .await;
-                    signal_count += signals.len();
-                    for sig in signals {
-                        self.notifier.dispatch(sig).await;
-                    }
-                }
-                if let Some(ref map_15m) = snapshot_15m {
-                    if let Some(klines_15m) = map_15m.get(sym) {
-                        let signals_15m = self
-                            .evaluate_symbol_candles_for_tf(sym, "15m", klines_15m, true)
-                            .await;
-                        signal_count += signals_15m.len();
-                        for sig in signals_15m {
-                            self.notifier.dispatch(sig).await;
-                        }
-                    }
-                }
-            }
+            signal_count += self.rescan_cached_mtf_buffers(&symbols).await;
         }
 
         // Scan Funding Rates & initialize Open Interest baseline
@@ -424,7 +457,7 @@ impl FuturesScanner {
         // Spawn All-Market Liquidation stream (!forceOrder@arr)
         spawn_liquidation_ws_worker(self.config.ws_base_url.clone(), liq_tx);
 
-        // Spawn periodic poller for Funding Rates, Open Interest Spikes, and 24hr Ticker refresh
+        // Spawn periodic poller for MTF RAM rescan, Funding Rates, Open Interest Spikes, and 24hr Ticker refresh
         let scanner_poller = self.clone();
         let tracked_symbols = symbols.clone();
         tokio::spawn(async move {
@@ -440,10 +473,10 @@ impl FuturesScanner {
                 tokio::select! {
                     _ = interval.tick() => {}
                     _ = scanner_poller.scan_now_notify.notified() => {
-                        info!("🔍 กำลังอัปเดตข้อมูลตลาด Funding Rate / Open Interest ตามคำสั่ง Telegram...");
+                        info!("🔍 กำลังสแกนตลาด MTF (5m+15m+1h) + Funding/OI ตามคำสั่ง Telegram...");
                     }
                 }
-                debug!("กำลังอัปเดตข้อมูล Funding Rate, Open Interest และ 24h Ticker...");
+                debug!("กำลังสแกน MTF จาก RAM พร้อมอัปเดต Funding Rate, Open Interest และ 24h Ticker...");
 
                 if let Ok((_, new_tickers)) =
                     scanner_poller.client.fetch_qualified_usdt_perpetuals().await
@@ -460,6 +493,9 @@ impl FuturesScanner {
                     }
                 }
 
+                scanner_poller
+                    .rescan_cached_mtf_buffers(&tracked_symbols)
+                    .await;
                 scanner_poller.scan_funding_rates(&active_set).await;
                 scanner_poller.scan_open_interest(&tracked_symbols).await;
                 scanner_poller.save_state().await;
@@ -699,9 +735,11 @@ impl FuturesScanner {
             });
         }
 
-        // 2. Real-time Volume Spike check
+        // 2. Real-time Volume Spike check (require >= 0.6% directional move to avoid flat doji noise)
         if let Some((vol_ratio, avg_vol)) = vol_ratio_opt {
-            if vol_ratio >= self.config.volume_spike_multiplier {
+            if vol_ratio >= self.config.volume_spike_multiplier
+                && candle_chg.abs() >= VOLUME_SPIKE_MIN_MOVE_PCT
+            {
                 let direction = if candle_chg >= 0.0 {
                     SignalDirection::Bullish
                 } else {
@@ -730,190 +768,195 @@ impl FuturesScanner {
         }
 
         // 3. Technical Indicators (evaluated on closed candles to prevent repainting)
-        if !check_closed_indicators {
-            signals.retain(|s| active_strategy.allows_category(s.category));
-            if signals.is_empty() || active_strategy.requires_1h_alignment() || eff_min_stars >= 3 {
-                return Vec::new();
-            }
-            let mut active_signals = Vec::with_capacity(signals.len());
-            for mut sig in signals {
-                if !self.notifier.is_in_cooldown(&sig.symbol, sig.category).await {
-                    sig.details
-                        .push(("🎯 กลยุทธ์".to_string(), active_strategy.title_th().to_string()));
-                    append_trade_plan(&mut sig.details, sig.direction, sig.price, Some(candles));
-                    active_signals.push(sig);
-                }
-            }
-            if !active_signals.is_empty() {
-                let count = active_signals.len() as u64;
-                self.metrics.raw_triggers.fetch_add(count, Ordering::Relaxed);
-                self.metrics.passed_signals.fetch_add(count, Ordering::Relaxed);
-            }
-            return active_signals;
-        }
+        if check_closed_indicators {
+            // Use completed candles for indicator evaluation
+            let eval_slice =
+                if candles.last().map(|c| !c.is_closed).unwrap_or(false) && candles.len() > 1 {
+                    &candles[..candles.len() - 1]
+                } else {
+                    candles
+                };
 
-        // Use completed candles for indicator evaluation
-        let eval_slice = if candles.last().map(|c| !c.is_closed).unwrap_or(false) && candles.len() > 1 {
-            &candles[..candles.len() - 1]
-        } else {
-            candles
-        };
+            let closes: Vec<f64> = eval_slice.iter().map(|c| c.close).collect();
+            let eval_price = *closes.last().unwrap_or(&latest.close);
 
-        let closes: Vec<f64> = eval_slice.iter().map(|c| c.close).collect();
-        let eval_price = *closes.last().unwrap_or(&latest.close);
-
-        // 3a. RSI Overbought / Oversold
-        if let Some(rsi) = calculate_rsi(&closes, self.config.rsi_period) {
-            if rsi >= self.config.rsi_overbought {
-                signals.push(ScanSignal {
-                    symbol: symbol.to_string(),
-                    category: SignalCategory::RsiOverbought,
-                    direction: SignalDirection::Bearish,
-                    price: eval_price,
-                    change_24h_pct: change_24h,
-                    quote_volume_24h: vol_24h,
-                    timeframe: tf.to_string(),
-                    metric_summary: format!(
-                        "[{}] RSI({}) = {:.2} (Overbought >= {:.0})",
-                        tf, self.config.rsi_period, rsi, self.config.rsi_overbought
-                    ),
-                    details: vec![
-                        (format!("RSI({})", self.config.rsi_period), format!("{:.2}", rsi)),
-                        ("สถานะ".to_string(), "Overbought (ระวังแรงเทขาย/ย่อตัว)".to_string()),
-                    ],
-                    timestamp: Utc::now(),
-                });
-            } else if rsi <= self.config.rsi_oversold {
-                signals.push(ScanSignal {
-                    symbol: symbol.to_string(),
-                    category: SignalCategory::RsiOversold,
-                    direction: SignalDirection::Bullish,
-                    price: eval_price,
-                    change_24h_pct: change_24h,
-                    quote_volume_24h: vol_24h,
-                    timeframe: tf.to_string(),
-                    metric_summary: format!(
-                        "[{}] RSI({}) = {:.2} (Oversold <= {:.0})",
-                        tf, self.config.rsi_period, rsi, self.config.rsi_oversold
-                    ),
-                    details: vec![
-                        (format!("RSI({})", self.config.rsi_period), format!("{:.2}", rsi)),
-                        ("สถานะ".to_string(), "Oversold (ลุ้นรีบาวด์/กลับตัวขึ้น)".to_string()),
-                    ],
-                    timestamp: Utc::now(),
-                });
-            }
-        }
-
-        // 3b. EMA Fast / Slow Crossover
-        if let Some(ema_res) = detect_ema_crossover(
-            &closes,
-            self.config.ema_fast_period,
-            self.config.ema_slow_period,
-        ) {
-            match ema_res.crossover {
-                Some(CrossoverType::Bullish) => {
+            // 3a. RSI Overbought / Oversold
+            if let Some(rsi) = calculate_rsi(&closes, self.config.rsi_period) {
+                if rsi >= self.config.rsi_overbought {
                     signals.push(ScanSignal {
                         symbol: symbol.to_string(),
-                        category: SignalCategory::EmaBullishCross,
-                        direction: SignalDirection::Bullish,
-                        price: eval_price,
-                        change_24h_pct: change_24h,
-                        quote_volume_24h: vol_24h,
-                        timeframe: tf.to_string(),
-                        metric_summary: format!(
-                            "[{}] EMA({}) ตัดขึ้นเหนือ EMA({}) (Golden Cross)",
-                            tf, self.config.ema_fast_period, self.config.ema_slow_period
-                        ),
-                        details: vec![
-                            (format!("EMA({})", self.config.ema_fast_period), format_price(ema_res.fast_now)),
-                            (format!("EMA({})", self.config.ema_slow_period), format_price(ema_res.slow_now)),
-                        ],
-                        timestamp: Utc::now(),
-                    });
-                }
-                Some(CrossoverType::Bearish) => {
-                    signals.push(ScanSignal {
-                        symbol: symbol.to_string(),
-                        category: SignalCategory::EmaBearishCross,
+                        category: SignalCategory::RsiOverbought,
                         direction: SignalDirection::Bearish,
                         price: eval_price,
                         change_24h_pct: change_24h,
                         quote_volume_24h: vol_24h,
                         timeframe: tf.to_string(),
                         metric_summary: format!(
-                            "[{}] EMA({}) ตัดลงต่ำกว่า EMA({}) (Death Cross)",
-                            tf, self.config.ema_fast_period, self.config.ema_slow_period
+                            "[{}] RSI({}) = {:.2} (Overbought >= {:.0})",
+                            tf, self.config.rsi_period, rsi, self.config.rsi_overbought
                         ),
                         details: vec![
-                            (format!("EMA({})", self.config.ema_fast_period), format_price(ema_res.fast_now)),
-                            (format!("EMA({})", self.config.ema_slow_period), format_price(ema_res.slow_now)),
+                            (format!("RSI({})", self.config.rsi_period), format!("{:.2}", rsi)),
+                            ("สถานะ".to_string(), "Overbought (ระวังแรงเทขาย/ย่อตัว)".to_string()),
+                        ],
+                        timestamp: Utc::now(),
+                    });
+                } else if rsi <= self.config.rsi_oversold {
+                    signals.push(ScanSignal {
+                        symbol: symbol.to_string(),
+                        category: SignalCategory::RsiOversold,
+                        direction: SignalDirection::Bullish,
+                        price: eval_price,
+                        change_24h_pct: change_24h,
+                        quote_volume_24h: vol_24h,
+                        timeframe: tf.to_string(),
+                        metric_summary: format!(
+                            "[{}] RSI({}) = {:.2} (Oversold <= {:.0})",
+                            tf, self.config.rsi_period, rsi, self.config.rsi_oversold
+                        ),
+                        details: vec![
+                            (format!("RSI({})", self.config.rsi_period), format!("{:.2}", rsi)),
+                            ("สถานะ".to_string(), "Oversold (ลุ้นรีบาวด์/กลับตัวขึ้น)".to_string()),
                         ],
                         timestamp: Utc::now(),
                     });
                 }
-                None => {}
+            }
+
+            // 3b. EMA Fast / Slow Crossover
+            if let Some(ema_res) = detect_ema_crossover(
+                &closes,
+                self.config.ema_fast_period,
+                self.config.ema_slow_period,
+            ) {
+                match ema_res.crossover {
+                    Some(CrossoverType::Bullish) => {
+                        signals.push(ScanSignal {
+                            symbol: symbol.to_string(),
+                            category: SignalCategory::EmaBullishCross,
+                            direction: SignalDirection::Bullish,
+                            price: eval_price,
+                            change_24h_pct: change_24h,
+                            quote_volume_24h: vol_24h,
+                            timeframe: tf.to_string(),
+                            metric_summary: format!(
+                                "[{}] EMA({}) ตัดขึ้นเหนือ EMA({}) (Golden Cross)",
+                                tf, self.config.ema_fast_period, self.config.ema_slow_period
+                            ),
+                            details: vec![
+                                (format!("EMA({})", self.config.ema_fast_period), format_price(ema_res.fast_now)),
+                                (format!("EMA({})", self.config.ema_slow_period), format_price(ema_res.slow_now)),
+                            ],
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    Some(CrossoverType::Bearish) => {
+                        signals.push(ScanSignal {
+                            symbol: symbol.to_string(),
+                            category: SignalCategory::EmaBearishCross,
+                            direction: SignalDirection::Bearish,
+                            price: eval_price,
+                            change_24h_pct: change_24h,
+                            quote_volume_24h: vol_24h,
+                            timeframe: tf.to_string(),
+                            metric_summary: format!(
+                                "[{}] EMA({}) ตัดลงต่ำกว่า EMA({}) (Death Cross)",
+                                tf, self.config.ema_fast_period, self.config.ema_slow_period
+                            ),
+                            details: vec![
+                                (format!("EMA({})", self.config.ema_fast_period), format_price(ema_res.fast_now)),
+                                (format!("EMA({})", self.config.ema_slow_period), format_price(ema_res.slow_now)),
+                            ],
+                            timestamp: Utc::now(),
+                        });
+                    }
+                    None => {}
+                }
+            }
+
+            // 3c. Bollinger Bands Breakout accompanied by Volume
+            if let Some(bb) =
+                calculate_bollinger_bands(&closes, self.config.bb_period, self.config.bb_std_dev)
+            {
+                let eval_vol_ratio = calculate_volume_ratio(eval_slice, self.config.volume_lookback)
+                    .map(|(r, _)| r)
+                    .unwrap_or(1.0);
+
+                if eval_price > bb.upper && eval_vol_ratio >= self.config.bb_min_volume_ratio {
+                    signals.push(ScanSignal {
+                        symbol: symbol.to_string(),
+                        category: SignalCategory::BollingerUpperBreakout,
+                        direction: SignalDirection::Bullish,
+                        price: eval_price,
+                        change_24h_pct: change_24h,
+                        quote_volume_24h: vol_24h,
+                        timeframe: tf.to_string(),
+                        metric_summary: format!(
+                            "[{}] ราคาปิดทะลุ Upper Bollinger Band พร้อมวอลุ่ม {:.2}x",
+                            tf, eval_vol_ratio
+                        ),
+                        details: vec![
+                            ("Upper Band".to_string(), format!("${}", format_price(bb.upper))),
+                            ("Middle Band".to_string(), format!("${}", format_price(bb.middle))),
+                            ("Bandwidth".to_string(), format!("{:.2}%", bb.bandwidth_pct)),
+                            ("Relative Volume".to_string(), format!("{:.2}x", eval_vol_ratio)),
+                        ],
+                        timestamp: Utc::now(),
+                    });
+                } else if eval_price < bb.lower && eval_vol_ratio >= self.config.bb_min_volume_ratio {
+                    signals.push(ScanSignal {
+                        symbol: symbol.to_string(),
+                        category: SignalCategory::BollingerLowerBreakout,
+                        direction: SignalDirection::Bearish,
+                        price: eval_price,
+                        change_24h_pct: change_24h,
+                        quote_volume_24h: vol_24h,
+                        timeframe: tf.to_string(),
+                        metric_summary: format!(
+                            "[{}] ราคาปิดหลุด Lower Bollinger Band พร้อมวอลุ่ม {:.2}x",
+                            tf, eval_vol_ratio
+                        ),
+                        details: vec![
+                            ("Lower Band".to_string(), format!("${}", format_price(bb.lower))),
+                            ("Middle Band".to_string(), format!("${}", format_price(bb.middle))),
+                            ("Bandwidth".to_string(), format!("{:.2}%", bb.bandwidth_pct)),
+                            ("Relative Volume".to_string(), format!("{:.2}x", eval_vol_ratio)),
+                        ],
+                        timestamp: Utc::now(),
+                    });
+                }
             }
         }
 
-        // 3c. Bollinger Bands Breakout accompanied by Volume
-        if let Some(bb) =
-            calculate_bollinger_bands(&closes, self.config.bb_period, self.config.bb_std_dev)
-        {
-            let eval_vol_ratio = calculate_volume_ratio(eval_slice, self.config.volume_lookback)
-                .map(|(r, _)| r)
-                .unwrap_or(1.0);
+        if signals.is_empty() {
+            return signals;
+        }
 
-            if eval_price > bb.upper && eval_vol_ratio >= self.config.bb_min_volume_ratio {
-                signals.push(ScanSignal {
-                    symbol: symbol.to_string(),
-                    category: SignalCategory::BollingerUpperBreakout,
-                    direction: SignalDirection::Bullish,
-                    price: eval_price,
-                    change_24h_pct: change_24h,
-                    quote_volume_24h: vol_24h,
-                    timeframe: tf.to_string(),
-                    metric_summary: format!(
-                        "[{}] ราคาปิดทะลุ Upper Bollinger Band พร้อมวอลุ่ม {:.2}x",
-                        tf, eval_vol_ratio
-                    ),
-                    details: vec![
-                        ("Upper Band".to_string(), format!("${}", format_price(bb.upper))),
-                        ("Middle Band".to_string(), format!("${}", format_price(bb.middle))),
-                        ("Bandwidth".to_string(), format!("{:.2}%", bb.bandwidth_pct)),
-                        ("Relative Volume".to_string(), format!("{:.2}x", eval_vol_ratio)),
-                    ],
-                    timestamp: Utc::now(),
-                });
-            } else if eval_price < bb.lower && eval_vol_ratio >= self.config.bb_min_volume_ratio {
-                signals.push(ScanSignal {
-                    symbol: symbol.to_string(),
-                    category: SignalCategory::BollingerLowerBreakout,
-                    direction: SignalDirection::Bearish,
-                    price: eval_price,
-                    change_24h_pct: change_24h,
-                    quote_volume_24h: vol_24h,
-                    timeframe: tf.to_string(),
-                    metric_summary: format!(
-                        "[{}] ราคาปิดหลุด Lower Bollinger Band พร้อมวอลุ่ม {:.2}x",
-                        tf, eval_vol_ratio
-                    ),
-                    details: vec![
-                        ("Lower Band".to_string(), format!("${}", format_price(bb.lower))),
-                        ("Middle Band".to_string(), format!("${}", format_price(bb.middle))),
-                        ("Bandwidth".to_string(), format!("{:.2}%", bb.bandwidth_pct)),
-                        ("Relative Volume".to_string(), format!("{:.2}x", eval_vol_ratio)),
-                    ],
-                    timestamp: Utc::now(),
-                });
+        // On mid-candle ticks, throttle repeated MTF checks per (symbol, tf, category) to once every 30s
+        // so high-frequency WS updates don't inflate raw_triggers or repeat failed MTF checks on every tick,
+        // while still allowing mid-candle Pump/Dump/VolumeSpike triggers to pass full MTF & open Paper Trades.
+        if !check_closed_indicators {
+            let mut throttled = Vec::with_capacity(signals.len());
+            for sig in signals {
+                if self.notifier.is_in_cooldown(&sig.symbol, sig.category).await {
+                    continue;
+                }
+                if self
+                    .should_allow_mid_candle_eval(&sig.symbol, trigger_tf, sig.category)
+                    .await
+                {
+                    throttled.push(sig);
+                }
             }
+            if throttled.is_empty() {
+                return throttled;
+            }
+            signals = throttled;
         }
 
-        if !signals.is_empty() {
-            self.metrics
-                .raw_triggers
-                .fetch_add(signals.len() as u64, Ordering::Relaxed);
-        }
+        self.metrics
+            .raw_triggers
+            .fetch_add(signals.len() as u64, Ordering::Relaxed);
 
         // Apply active strategy category filter before cooldown/MTF lookup
         signals.retain(|s| active_strategy.allows_category(s.category));
@@ -922,16 +965,18 @@ impl FuturesScanner {
         }
 
         // Filter out signals still inside cooldown before fetching 1h/MTF context or opening paper positions
-        let mut active_signals = Vec::with_capacity(signals.len());
-        for sig in signals {
-            if !self.notifier.is_in_cooldown(&sig.symbol, sig.category).await {
-                active_signals.push(sig);
+        if check_closed_indicators {
+            let mut active_signals = Vec::with_capacity(signals.len());
+            for sig in signals {
+                if !self.notifier.is_in_cooldown(&sig.symbol, sig.category).await {
+                    active_signals.push(sig);
+                }
             }
+            if active_signals.is_empty() {
+                return active_signals;
+            }
+            signals = active_signals;
         }
-        if active_signals.is_empty() {
-            return active_signals;
-        }
-        let mut signals = active_signals;
 
         // Reuse in-memory 5m/15m buffers and 300s-cached 1h candles for Multi-Timeframe Confluence
         let (res_5m, res_15m, res_1h) = if trigger_tf == "15m" {
@@ -1673,6 +1718,189 @@ mod tests {
         assert!(filtered_sol.is_empty());
         assert_eq!(scanner.metrics.passed_signals.load(Ordering::Relaxed), 1);
         assert!(scanner.metrics.raw_triggers.load(Ordering::Relaxed) >= 4);
+
+        let _ = fs::remove_file(&cfg.state_file);
+        let _ = fs::remove_file(&cfg.paper_state_file);
+        let _ = fs::remove_file(&cfg.paper_trades_csv);
+    }
+
+    #[tokio::test]
+    async fn test_mid_candle_volume_spike_mtf_sharpness_and_throttle() {
+        let cfg = test_scanner_config("mid_mtf", TradingStrategy::TrendFollow);
+        let notifier = AlertNotifier::new(cfg.clone());
+        let pt = PaperTrader::new(cfg.clone(), notifier.clone());
+        let scanner = FuturesScanner::new(cfg.clone(), notifier, pt);
+
+        let candles_5m_base = build_bullish_steady_candles(59, 300_000);
+        let last_base = *candles_5m_base.last().unwrap();
+        let next_open_time = last_base.open_time + 300_000;
+
+        // Unclosed flat doji (+0.10%) with 5x volume -> should be filtered out (< 0.6% move)
+        let mut doji_5m = candles_5m_base.clone();
+        let mut doji_candle = make_candle(
+            next_open_time,
+            last_base.close,
+            last_base.close * 1.001,
+            false,
+        );
+        doji_candle.quote_volume = 5_000_000.0;
+        doji_5m.push(doji_candle);
+
+        // Unclosed directional candle (+1.20%) with 5x volume -> valid VolumeSpike
+        let mut spike_5m = candles_5m_base;
+        let mut spike_candle = make_candle(
+            next_open_time,
+            last_base.close,
+            last_base.close * 1.012,
+            false,
+        );
+        spike_candle.quote_volume = 5_000_000.0;
+        spike_5m.push(spike_candle);
+
+        let candles_15m_bull = build_bullish_steady_candles(60, 900_000);
+        let candles_1h_bull = build_bullish_steady_candles(60, 3_600_000);
+        let candles_1h_bear = build_bearish_steady_candles(60, 3_600_000);
+        let now_ts = Utc::now().timestamp();
+
+        {
+            let mut g15 = scanner.candles_15m.write().await;
+            g15.insert("BTCUSDT".to_string(), candles_15m_bull.clone());
+            g15.insert("ETHUSDT".to_string(), candles_15m_bull);
+        }
+        {
+            let mut g1h = scanner.candles_1h_cache.write().await;
+            g1h.insert("BTCUSDT".to_string(), (now_ts, candles_1h_bull));
+            g1h.insert("ETHUSDT".to_string(), (now_ts, candles_1h_bear));
+        }
+
+        // 1) Flat doji with 5x volume is rejected before raw_triggers
+        let flat_res = scanner
+            .evaluate_symbol_candles_for_tf("BTCUSDT", "5m", &doji_5m, false)
+            .await;
+        assert!(flat_res.is_empty());
+        assert_eq!(scanner.metrics.raw_triggers.load(Ordering::Relaxed), 0);
+
+        // 2) Directional mid-candle VolumeSpike with bearish 1h fails MTF without burning cooldown
+        let eth_fail_1 = scanner
+            .evaluate_symbol_candles_for_tf("ETHUSDT", "5m", &spike_5m, false)
+            .await;
+        assert!(eth_fail_1.is_empty());
+        assert_eq!(scanner.metrics.raw_triggers.load(Ordering::Relaxed), 1);
+        assert!(
+            !scanner
+                .notifier
+                .is_in_cooldown("ETHUSDT", SignalCategory::VolumeSpike)
+                .await
+        );
+
+        // 3) Immediate second mid-candle tick is suppressed by the 30s throttle
+        let eth_throttled = scanner
+            .evaluate_symbol_candles_for_tf("ETHUSDT", "5m", &spike_5m, false)
+            .await;
+        assert!(eth_throttled.is_empty());
+        assert_eq!(scanner.metrics.raw_triggers.load(Ordering::Relaxed), 1);
+
+        // 4) Bar-close evaluation bypasses mid-candle throttle immediately
+        let eth_close = scanner
+            .evaluate_symbol_candles_for_tf("ETHUSDT", "5m", &spike_5m, true)
+            .await;
+        assert!(eth_close.is_empty());
+        assert_eq!(scanner.metrics.raw_triggers.load(Ordering::Relaxed), 2);
+
+        // 5) Aligned 5m+15m+1h mid-candle VolumeSpike passes TrendFollow (3⭐ + 1h) and opens Paper Trade
+        let btc_pass = scanner
+            .evaluate_symbol_candles_for_tf("BTCUSDT", "5m", &spike_5m, false)
+            .await;
+        assert_eq!(btc_pass.len(), 1);
+        assert_eq!(btc_pass[0].category, SignalCategory::VolumeSpike);
+        assert_eq!(btc_pass[0].timeframe, "5m+15m+1h");
+        assert_eq!(scanner.metrics.passed_signals.load(Ordering::Relaxed), 1);
+
+        let snap = scanner.paper_trader.get_state_snapshot().await;
+        assert_eq!(snap.open_positions.len(), 1);
+        assert_eq!(snap.open_positions[0].symbol, "BTCUSDT");
+        assert_eq!(snap.open_positions[0].strategy, "TREND_FOLLOW");
+        assert_eq!(snap.open_positions[0].timeframe, "5m+15m+1h");
+        assert_eq!(snap.open_positions[0].stars, 3);
+
+        let _ = fs::remove_file(&cfg.state_file);
+        let _ = fs::remove_file(&cfg.paper_state_file);
+        let _ = fs::remove_file(&cfg.paper_trades_csv);
+    }
+
+    #[tokio::test]
+    async fn test_rescan_cached_mtf_buffers_catches_1h_alignment_flip() {
+        let cfg = test_scanner_config("rescan_mtf", TradingStrategy::TrendFollow);
+        let notifier = AlertNotifier::new(cfg.clone());
+        let pt = PaperTrader::new(cfg.clone(), notifier.clone());
+        let scanner = FuturesScanner::new(cfg.clone(), notifier, pt);
+
+        let candles_5m = build_bullish_steady_candles(60, 300_000);
+        // Simulate live 15m buffer: closed EMA Golden Cross bar followed by an unclosed live candle
+        let mut candles_15m = build_bullish_ema_cross_candles(900_000);
+        let last_15m = *candles_15m.last().unwrap();
+        candles_15m.push(make_candle(
+            last_15m.open_time + 900_000,
+            last_15m.close,
+            last_15m.close + 0.05,
+            false,
+        ));
+        let candles_1h_bear = build_bearish_steady_candles(60, 3_600_000);
+        let candles_1h_bull = build_bullish_steady_candles(60, 3_600_000);
+        let now_ts = Utc::now().timestamp();
+
+        {
+            let mut g5 = scanner.candles.write().await;
+            g5.insert("BTCUSDT".to_string(), candles_5m);
+        }
+        {
+            let mut g15 = scanner.candles_15m.write().await;
+            g15.insert("BTCUSDT".to_string(), candles_15m);
+        }
+        {
+            let mut g1h = scanner.candles_1h_cache.write().await;
+            g1h.insert("BTCUSDT".to_string(), (now_ts, candles_1h_bear));
+        }
+
+        let symbols = vec!["BTCUSDT".to_string()];
+
+        // 1) Bearish 1h blocks the closed-bar 15m EMA cross on rescan
+        let count_blocked = scanner.rescan_cached_mtf_buffers(&symbols).await;
+        assert_eq!(count_blocked, 0);
+        assert!(
+            scanner
+                .paper_trader
+                .get_state_snapshot()
+                .await
+                .open_positions
+                .is_empty()
+        );
+
+        // 2) Once 1h flips bullish, the 60s in-RAM rescan catches the setup and opens a Paper Trade
+        {
+            let mut g1h = scanner.candles_1h_cache.write().await;
+            g1h.insert("BTCUSDT".to_string(), (now_ts, candles_1h_bull));
+        }
+        let count_caught = scanner.rescan_cached_mtf_buffers(&symbols).await;
+        assert_eq!(count_caught, 1);
+        let snap = scanner.paper_trader.get_state_snapshot().await;
+        assert_eq!(snap.open_positions.len(), 1);
+        assert_eq!(snap.open_positions[0].symbol, "BTCUSDT");
+        assert_eq!(snap.open_positions[0].strategy, "TREND_FOLLOW");
+        assert_eq!(snap.open_positions[0].timeframe, "15m+5m+1h");
+
+        // 3) Next rescan respects cooldown without duplicating signal or trade
+        let count_dup = scanner.rescan_cached_mtf_buffers(&symbols).await;
+        assert_eq!(count_dup, 0);
+        assert_eq!(
+            scanner
+                .paper_trader
+                .get_state_snapshot()
+                .await
+                .open_positions
+                .len(),
+            1
+        );
 
         let _ = fs::remove_file(&cfg.state_file);
         let _ = fs::remove_file(&cfg.paper_state_file);

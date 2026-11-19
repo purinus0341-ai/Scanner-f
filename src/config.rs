@@ -101,20 +101,20 @@ impl ScannerConfig {
                 .and_then(|s| TradingStrategy::from_str_lossy(&s))
                 .unwrap_or_default(),
 
-            price_change_threshold_pct: env_f64("PRICE_CHANGE_THRESHOLD_PCT", 2.5),
-            volume_spike_multiplier: env_f64("VOLUME_SPIKE_MULTIPLIER", 3.5),
+            price_change_threshold_pct: env_f64("PRICE_CHANGE_THRESHOLD_PCT", 2.2),
+            volume_spike_multiplier: env_f64("VOLUME_SPIKE_MULTIPLIER", 3.2),
             volume_lookback: env_usize("VOLUME_LOOKBACK", 20),
 
             rsi_period: env_usize("RSI_PERIOD", 14),
-            rsi_overbought: env_f64("RSI_OVERBOUGHT", 75.0),
-            rsi_oversold: env_f64("RSI_OVERSOLD", 25.0),
+            rsi_overbought: env_f64("RSI_OVERBOUGHT", 72.0),
+            rsi_oversold: env_f64("RSI_OVERSOLD", 28.0),
 
             ema_fast_period: env_usize("EMA_FAST_PERIOD", 9),
             ema_slow_period: env_usize("EMA_SLOW_PERIOD", 21),
 
             bb_period: env_usize("BB_PERIOD", 20),
             bb_std_dev: env_f64("BB_STD_DEV", 2.0),
-            bb_min_volume_ratio: env_f64("BB_MIN_VOLUME_RATIO", 1.8),
+            bb_min_volume_ratio: env_f64("BB_MIN_VOLUME_RATIO", 1.6),
 
             funding_rate_threshold_pct: env_f64("FUNDING_RATE_THRESHOLD_PCT", 0.10),
             oi_spike_threshold_pct: env_f64("OI_SPIKE_THRESHOLD_PCT", 3.0),
