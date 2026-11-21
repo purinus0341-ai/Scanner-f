@@ -15,6 +15,12 @@ use crate::models::{
     Ticker24hr, WsForceOrderEvent, WsKlineEvent,
 };
 
+pub struct MarketSnapshot {
+    pub symbols: Vec<String>,
+    pub qualified_tickers: HashMap<String, Ticker24hr>,
+    pub all_prices: HashMap<String, f64>,
+}
+
 #[derive(Clone)]
 pub struct BinanceFuturesClient {
     config: ScannerConfig,
@@ -33,10 +39,8 @@ impl BinanceFuturesClient {
     }
 
     /// Returns active USDT-M Perpetual symbols filtered by minimum 24h quote volume,
-    /// sorted by 24h quote volume descending, along with their 24h ticker snapshot.
-    pub async fn fetch_qualified_usdt_perpetuals(
-        &self,
-    ) -> Result<(Vec<String>, HashMap<String, Ticker24hr>)> {
+    /// sorted by descending 24h quote volume, plus prices for existing paper positions.
+    pub async fn fetch_market_snapshot(&self) -> Result<MarketSnapshot> {
         let exchange_info_url = format!("{}/fapi/v1/exchangeInfo", self.config.rest_base_url);
         let resp = self
             .http
@@ -82,31 +86,12 @@ impl BinanceFuturesClient {
             .await
             .context("Failed to parse /fapi/v1/ticker/24hr JSON")?;
 
-        let mut qualified: Vec<Ticker24hr> = tickers
-            .into_iter()
-            .filter(|t| {
-                valid_perps.contains(&t.symbol)
-                    && t.quote_volume_f64() >= self.config.min_quote_volume_24h
-            })
-            .collect();
-
-        qualified.sort_by(|a, b| {
-            b.quote_volume_f64()
-                .partial_cmp(&a.quote_volume_f64())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        if qualified.len() > self.config.max_symbols {
-            qualified.truncate(self.config.max_symbols);
-        }
-
-        let symbols: Vec<String> = qualified.iter().map(|t| t.symbol.clone()).collect();
-        let ticker_map: HashMap<String, Ticker24hr> = qualified
-            .into_iter()
-            .map(|t| (t.symbol.clone(), t))
-            .collect();
-
-        Ok((symbols, ticker_map))
+        Ok(build_market_snapshot(
+            tickers,
+            &valid_perps,
+            self.config.min_quote_volume_24h,
+            self.config.max_symbols,
+        ))
     }
 
     /// Fetches historical klines (`/fapi/v1/klines`) for a symbol.
@@ -372,6 +357,41 @@ pub fn spawn_liquidation_ws_worker(
     });
 }
 
+fn build_market_snapshot(
+    tickers: Vec<Ticker24hr>,
+    valid_perps: &HashSet<String>,
+    min_quote_volume: f64,
+    max_symbols: usize,
+) -> MarketSnapshot {
+    let mut all_prices = HashMap::with_capacity(tickers.len());
+    let mut qualified = Vec::new();
+    for ticker in tickers {
+        let price = ticker.last_price_f64();
+        if price.is_finite() && price > 0.0 {
+            all_prices.insert(ticker.symbol.clone(), price);
+        }
+        if valid_perps.contains(&ticker.symbol) && ticker.quote_volume_f64() >= min_quote_volume {
+            qualified.push(ticker);
+        }
+    }
+
+    qualified.sort_by(|a, b| {
+        b.quote_volume_f64()
+            .partial_cmp(&a.quote_volume_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    qualified.truncate(max_symbols);
+
+    MarketSnapshot {
+        symbols: qualified.iter().map(|t| t.symbol.clone()).collect(),
+        qualified_tickers: qualified
+            .into_iter()
+            .map(|t| (t.symbol.clone(), t))
+            .collect(),
+        all_prices,
+    }
+}
+
 fn value_to_f64(val: &Value) -> f64 {
     if let Some(s) = val.as_str() {
         s.parse::<f64>().unwrap_or(0.0)
@@ -379,5 +399,40 @@ fn value_to_f64(val: &Value) -> f64 {
         n
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prices_include_symbols_excluded_from_the_scan() {
+        let tickers = [
+            ("TOPUSDT", "101", "300"),
+            ("OUTRANKEDUSDT", "95", "200"),
+            ("LOWVOLUSDT", "98", "50"),
+            ("INVALIDUSDT", "NaN", "10"),
+        ]
+        .into_iter()
+        .map(|(symbol, last_price, quote_volume)| Ticker24hr {
+            symbol: symbol.to_string(),
+            last_price: last_price.to_string(),
+            price_change_percent: "0".to_string(),
+            volume: "1".to_string(),
+            quote_volume: quote_volume.to_string(),
+        })
+        .collect();
+        let eligible = ["TOPUSDT", "OUTRANKEDUSDT", "LOWVOLUSDT"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let snapshot = build_market_snapshot(tickers, &eligible, 100.0, 1);
+
+        assert_eq!(snapshot.symbols, vec!["TOPUSDT".to_string()]);
+        assert_eq!(snapshot.qualified_tickers.len(), 1);
+        assert_eq!(snapshot.all_prices.get("OUTRANKEDUSDT"), Some(&95.0));
+        assert_eq!(snapshot.all_prices.get("LOWVOLUSDT"), Some(&98.0));
+        assert!(!snapshot.all_prices.contains_key("INVALIDUSDT"));
     }
 }
