@@ -9,7 +9,9 @@ use tracing::{info, warn};
 use crate::binance::BinanceFuturesClient;
 use crate::config::ScannerConfig;
 use crate::notifier::{format_price, html_escape, AlertNotifier};
-use crate::paper_trader::{CsvTradeRow, PaperPortfolioState, PaperSide, PaperTrader};
+use crate::paper_trader::{
+    CsvTradeRow, PaperPortfolioState, PaperPosition, PaperSide, PaperTrader,
+};
 use crate::strategy::TradingStrategy;
 
 #[derive(Clone)]
@@ -851,6 +853,13 @@ fn fmt_num_clean(v: f64) -> String {
     }
 }
 
+fn price_received_label(position: &PaperPosition) -> String {
+    match position.last_price_received_at.as_ref() {
+        Some(time) => time.format("%d/%m/%Y %H:%M:%S UTC").to_string(),
+        None => "ไม่ทราบเวลา".to_string(),
+    }
+}
+
 pub fn render_dashboard_html(
     state: &PaperPortfolioState,
     cfg: &ScannerConfig,
@@ -968,11 +977,12 @@ pub fn render_dashboard_html(
                 format_price(p.last_price)
             ));
             lines.push(format!(
-                "   uPnL: <code>{:+.2} USDT ({:+.1}%)</code> | SL: <code>${}</code> | {}",
+                "   uPnL: <code>{:+.2} USDT ({:+.1}%)</code> | SL: <code>${}</code> | {} | รับราคา {}",
                 p.unrealized_pnl(),
                 p.unrealized_roe_pct(),
                 format_price(p.current_sl),
-                stage
+                stage,
+                price_received_label(p)
             ));
         }
     }
@@ -1326,14 +1336,15 @@ pub fn render_manage_html(state: &PaperPortfolioState) -> (String, Value) {
         };
         let pos_strat = TradingStrategy::from_str_lossy(&p.strategy).unwrap_or_default();
         lines.push(format!(
-            "• #{} {} <b>{}</b> [{}] | ราคา <code>${}</code> | uPnL <code>{:+.2} ({:+.1}%)</code>",
+            "• #{} {} <b>{}</b> [{}] | ราคา <code>${}</code> | uPnL <code>{:+.2} ({:+.1}%)</code> | รับราคา {}",
             p.id,
             side_icon,
             html_escape(&p.symbol),
             html_escape(pos_strat.short_tag()),
             format_price(p.last_price),
             upnl,
-            uroe
+            uroe,
+            price_received_label(p)
         ));
         rows.push(vec![json!({
             "text": format!("❌ ปิด #{} {} ({:+.2} USDT)", p.id, p.symbol, upnl),
@@ -1473,6 +1484,7 @@ mod tests {
             realized_pnl_trade: 4.0,
             fees_paid_trade: 0.5,
             last_price: 95800.0,
+            last_price_received_at: Some("2026-11-16T00:01:00Z".parse().unwrap()),
             opened_at: "2026-11-16T00:00:00Z".to_string(),
         });
 
@@ -1481,6 +1493,7 @@ mod tests {
         assert!(html.contains("&lt;TEST&gt;"));
         assert!(html.contains("[Trend]"));
         assert!(html.contains("กันทุน BE (ถือ 75%)"));
+        assert!(html.contains("รับราคา 16/11/2026 00:01:00 UTC"));
         assert!(html.contains("10x | ไม้ละ 10% | สูงสุด 5 ไม้"));
         let rows = kb.as_array().unwrap();
         assert_eq!(rows.len(), 5);

@@ -355,22 +355,19 @@ impl FuturesScanner {
             format_compact_usd(self.config.min_quote_volume_24h)
         );
 
-        let (symbols, ticker_map) = self.client.fetch_qualified_usdt_perpetuals().await?;
+        let market = self.client.fetch_market_snapshot().await?;
+        let symbols = market.symbols;
         info!(
             "พบเหรียญ USDT-M Perpetual ที่ผ่านเกณฑ์ทั้งหมด {} เหรียญ (สูงสุด {} เหรียญ)",
             symbols.len(),
             self.config.max_symbols
         );
 
-        let price_snapshot: HashMap<String, f64> = ticker_map
-            .iter()
-            .map(|(k, v)| (k.clone(), v.last_price_f64()))
-            .collect();
-        self.paper_trader.update_prices(&price_snapshot).await;
+        self.paper_trader.update_prices(&market.all_prices).await;
 
         {
             let mut t_guard = self.tickers.write().await;
-            *t_guard = ticker_map;
+            *t_guard = market.qualified_tickers;
         }
 
         let scan_15m_extra = self.config.kline_interval != "15m";
@@ -478,19 +475,11 @@ impl FuturesScanner {
                 }
                 debug!("กำลังสแกน MTF จาก RAM พร้อมอัปเดต Funding Rate, Open Interest และ 24h Ticker...");
 
-                if let Ok((_, new_tickers)) =
-                    scanner_poller.client.fetch_qualified_usdt_perpetuals().await
-                {
-                    let price_snapshot: HashMap<String, f64> = new_tickers
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.last_price_f64()))
-                        .collect();
-                    scanner_poller.paper_trader.update_prices(&price_snapshot).await;
+                if let Ok(market) = scanner_poller.client.fetch_market_snapshot().await {
+                    scanner_poller.paper_trader.update_prices(&market.all_prices).await;
 
                     let mut t_guard = scanner_poller.tickers.write().await;
-                    for (k, v) in new_tickers {
-                        t_guard.insert(k, v);
-                    }
+                    t_guard.extend(market.qualified_tickers);
                 }
 
                 scanner_poller

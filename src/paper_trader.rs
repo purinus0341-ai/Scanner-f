@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -76,6 +76,8 @@ pub struct PaperPosition {
     pub realized_pnl_trade: f64,
     pub fees_paid_trade: f64,
     pub last_price: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_price_received_at: Option<DateTime<Utc>>,
     pub opened_at: String,
 }
 
@@ -595,6 +597,7 @@ impl PaperTrader {
                 realized_pnl_trade: -entry_fee,
                 fees_paid_trade: entry_fee,
                 last_price: levels.entry_price,
+                last_price_received_at: None,
                 opened_at: Utc::now().to_rfc3339(),
             };
 
@@ -704,6 +707,7 @@ impl PaperTrader {
                 return;
             }
 
+            let received_at = Utc::now();
             let fee_rate = self.config.paper_taker_fee_pct / 100.0;
             let mut events = Vec::new();
             let mut state_changed = false;
@@ -715,12 +719,13 @@ impl PaperTrader {
                     idx += 1;
                     continue;
                 };
-                if price <= 0.0 {
+                if !price.is_finite() || price <= 0.0 {
                     idx += 1;
                     continue;
                 }
 
                 st.open_positions[idx].last_price = price;
+                st.open_positions[idx].last_price_received_at = Some(received_at);
                 let mut pos = st.open_positions[idx].clone();
                 let (tp1_pct, tp2_pct, tp3_pct) = pos.tp_close_splits();
                 let pos_strat = TradingStrategy::from_str_lossy(&pos.strategy).unwrap_or_default();
@@ -1395,6 +1400,7 @@ mod tests {
             let st = pt.state.lock().await;
             assert_eq!(st.open_positions.len(), 1);
             assert!(st.open_positions[0].tp1_hit);
+            assert!(st.open_positions[0].last_price_received_at.is_some());
             assert!(!st.open_positions[0].tp2_hit);
             assert!(st.open_positions[0].current_sl > 100.0);
             assert!((st.open_positions[0].remaining_fraction - 0.6).abs() < 1e-6);
@@ -1815,6 +1821,7 @@ mod tests {
         let legacy_state: PaperPortfolioState = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(legacy_state.effective_strategy(&cfg), TradingStrategy::Balanced);
         assert_eq!(legacy_state.open_positions[0].strategy, "BALANCED");
+        assert!(legacy_state.open_positions[0].last_price_received_at.is_none());
         assert_eq!(legacy_state.open_positions[0].tp_close_splits(), (40.0, 30.0, 30.0));
 
         let _ = fs::remove_file(&cfg.paper_state_file);
